@@ -1,0 +1,20 @@
+{
+  "name": "tamra-shifts",
+  "version": "1.0.0",
+  "description": "מערכת ניהול משמרות - תמרה דלקים (96) בע\"מ",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test lib/schedule.test.js lib/store.test.js lib/server.test.js",
+    "cron:generate": "node scripts/cron-generate.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.14",
+    "pg": "^8.12.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
