@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS employees (
   pin TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   max_shifts_per_week INTEGER,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shift_templates (
   id TEXT PRIMARY KEY,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS shift_templates (
 CREATE TABLE IF NOT EXISTS schedules (
   week_start TEXT PRIMARY KEY,
   understaffed TEXT NOT NULL,
-  generated_at INTEGER NOT NULL
+  generated_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assignments (
   id TEXT PRIMARY KEY,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS constraints (
   all_day INTEGER NOT NULL DEFAULT 0,
   start_time TEXT,
   end_time TEXT,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_constraints_emp ON constraints(employee_id);
 CREATE TABLE IF NOT EXISTS swap_requests (
@@ -63,8 +63,8 @@ CREATE TABLE IF NOT EXISTS swap_requests (
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
   claimed_by TEXT,
-  created_at INTEGER NOT NULL,
-  resolved_at INTEGER
+  created_at BIGINT NOT NULL,
+  resolved_at BIGINT
 );
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY,
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   related_id TEXT,
   channels TEXT NOT NULL DEFAULT '["inapp"]',
   read INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_audience ON notifications(audience, employee_id);
 `;
@@ -108,9 +108,29 @@ const DEFAULT_TEMPLATES = [
   { roleId: 'office', label: 'משרד', start: '08:00', end: '17:00', needed: 2, days: [0,1,2,3,4] },
 ];
 
+// One-time repair for databases created before timestamp columns were widened
+// to BIGINT (millisecond epoch values overflow Postgres's 32-bit INTEGER).
+// Safe to run every startup: ALTER COLUMN TYPE is a no-op once already BIGINT,
+// and each statement is isolated so a failure on one column can't block the rest.
+async function migrateTimestampColumns(db) {
+  if (db.dialect !== 'postgres') return;
+  const alters = [
+    'ALTER TABLE employees ALTER COLUMN created_at TYPE BIGINT',
+    'ALTER TABLE schedules ALTER COLUMN generated_at TYPE BIGINT',
+    'ALTER TABLE constraints ALTER COLUMN created_at TYPE BIGINT',
+    'ALTER TABLE swap_requests ALTER COLUMN created_at TYPE BIGINT',
+    'ALTER TABLE swap_requests ALTER COLUMN resolved_at TYPE BIGINT',
+    'ALTER TABLE notifications ALTER COLUMN created_at TYPE BIGINT',
+  ];
+  for (const s of alters) {
+    try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
+  }
+}
+
 async function initSchema(db) {
   const statements = SCHEMA.split(';').map(s => s.trim()).filter(Boolean);
   for (const s of statements) await db.exec(s + ';');
+  await migrateTimestampColumns(db);
   const row = await db.get('SELECT data FROM settings WHERE id = 1', []);
   if (!row) {
     await db.run('INSERT INTO settings (id, data) VALUES (1, ?)', [JSON.stringify(DEFAULT_SETTINGS)]);
