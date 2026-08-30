@@ -494,21 +494,39 @@ function employeesHtml() {
 }
 
 /* ---------- requests (manager) ---------- */
+function swapRowHtml(s) {
+  var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
+  var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
+  var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
+  return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
+    + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
+    + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
+    + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
+    + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td></tr>';
+}
+var SWAP_TABLE_HEAD = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead>';
+
 function requestsHtml() {
-  var swaps = CACHE.swaps || [];
-  return '<div class="card"><div class="card-head"><h2>בקשות החלפה / הברזה</h2></div>'
-    + (swaps.length ? ('<table class="xltable"><thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead><tbody>' + swaps.map(function (s) {
-        var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
-        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
-        var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
-        return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
-          + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
-          + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
-          + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-          + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td></tr>';
-      }).join('') + '</tbody></table>') : '<div class="empty">אין עדיין בקשות החלפה/הברזה</div>')
-    + '</div>'
-    + '<div class="card"><div class="card-head"><h2>כל ההתראות למנהל</h2></div>' + notifListHtml(CACHE.notifications || []) + '</div>';
+  var all = CACHE.swaps || [];
+  var open = all.filter(function (s) { return s.status === 'open'; });
+  var resolved = all.filter(function (s) { return s.status !== 'open'; });
+  var notifs = CACHE.notifications || [];
+  var unread = notifs.filter(function (n) { return !n.read; }).length;
+
+  var html = '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
+    + (open.length
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + open.map(swapRowHtml).join('') + '</tbody></table>')
+        : '<div class="empty">אין בקשות פתוחות כרגע — הכול מטופל</div>')
+    + '</div>';
+
+  html += '<div class="card"><div class="card-head"><h2>היסטוריית בקשות</h2></div>'
+    + (resolved.length
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(swapRowHtml).join('') + '</tbody></table>')
+        : '<div class="empty">אין עדיין היסטוריה</div>')
+    + '</div>';
+
+  html += '<div class="card"><div class="card-head"><h2>יומן התראות' + (unread ? ' — ' + unread + ' חדשות' : '') + '</h2></div>' + notifListHtml(notifs) + '</div>';
+  return html;
 }
 
 /* ---------- hours (manager) ---------- */
