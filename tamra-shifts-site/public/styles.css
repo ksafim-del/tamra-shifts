@@ -101,10 +101,6 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .modal-bg { position: fixed; inset: 0; background: rgba(20,15,8,.5); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
 .modal { background: var(--surface); border-radius: var(--radius); padding: 20px; max-width: 480px; width: 100%; max-height: 85vh; overflow: auto; }
 .modal h3 { margin-top: 0; }
-.day-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin: 10px 0; }
-.day-card h4 { margin: 0 0 8px; font-size: 15px; }
-.shift-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-top: 1px dashed var(--border); font-size: 13px; }
-.shift-row:first-of-type { border-top: none; }
 .understaffed { color: var(--err); font-weight: 700; }
 .toastzone { position: fixed; bottom: 16px; left: 16px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
 .toast { background: var(--deep); color: var(--deep-ink); padding: 10px 16px; border-radius: 8px; font-size: 14px; box-shadow: 0 4px 16px rgba(0,0,0,.2); }
