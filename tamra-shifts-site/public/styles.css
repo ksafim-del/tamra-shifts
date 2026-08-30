@@ -68,6 +68,10 @@ a { color: var(--accent); }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: right; }
 th { color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: none; }
+table.xltable, table.xltable th, table.xltable td { border: 1px solid var(--border); }
+table.xltable th { background: var(--surface-2); color: var(--text); }
+table.xltable tbody tr:nth-child(even) td { background: var(--surface-2); }
+table.xltable td, table.xltable th { vertical-align: top; }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .pill.status-open { background: #fdeccb; color: #7a4a0c; }
 .pill.status-claimed { background: #d8f0dd; color: #1e5c33; }
