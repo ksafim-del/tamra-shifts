@@ -363,7 +363,7 @@ function overviewHtml() {
     + '<div class="kpi"><div class="num">' + unread + '</div><div class="lbl">התראות שלא נקראו</div></div>'
     + '</div>';
 
-  html += '<div class="card"><div class="card-head"><h2>תקלות לפי יום — ' + weekLabel(wk) + '</h2></div>';
+  html += '<div class="card"><div class="card-head"><h2>תקלות והודעות לפי יום — ' + weekLabel(wk) + '</h2></div>';
   if (!week) {
     html += '<div class="empty">טוען…</div>';
   } else {
@@ -389,15 +389,22 @@ function overviewHtml() {
           items.push('<span class="pill status-open">בקשת החלפה פתוחה</span> ' + esc(t ? t.label : ''));
         }
       });
-      rows += '<tr><td style="width:120px"><b>' + dowName(dow) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span></td><td>'
-        + (items.length ? items.join('<br>') : '<span style="color:var(--ok)">אין תקלות</span>')
-        + '</td></tr>';
+      var dayNotifs = notifs.filter(function (n) {
+        var nd = new Date(n.ts);
+        return dateStrOf(nd.getFullYear(), nd.getMonth() + 1, nd.getDate()) === ds;
+      });
+      var notifItems = dayNotifs.map(function (n) {
+        var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+        return '<span class="mono">' + time + '</span> ' + (n.read ? '' : '<b>') + esc(n.text) + (n.read ? '' : '</b>');
+      });
+      rows += '<tr><td style="width:120px"><b>' + dowName(dow) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span></td>'
+        + '<td>' + (items.length ? items.join('<br>') : '<span style="color:var(--ok)">אין תקלות</span>') + '</td>'
+        + '<td>' + (notifItems.length ? notifItems.join('<br>') : '—') + '</td>'
+        + '</tr>';
     }
-    html += '<table><thead><tr><th style="width:120px">יום</th><th>תקלות</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    html += '<table class="xltable"><thead><tr><th style="width:120px">יום</th><th>תקלות</th><th>הודעות</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   html += '</div>';
-
-  html += '<div class="card"><div class="card-head"><h2>ההודעות האחרונות</h2></div>' + notifListHtml(notifs.slice(0, 8)) + '</div>';
   return html;
 }
 
@@ -533,7 +540,7 @@ function myScheduleHtml() {
   var mine = week.assignments.filter(function (a) { return a.employeeId === STATE.me.id; });
   if (!mine.length) { html += '<div class="empty">אין לך משמרות בשבוע זה' + (week.generatedAt ? '' : ' (הלוז עדיין לא הופק)') + '</div></div>'; return html; }
   var swaps = CACHE.swaps || [];
-  html += '<table><thead><tr><th>תאריך</th><th>משמרת</th><th>שעות</th><th></th></tr></thead><tbody>'
+  html += '<table class="xltable"><thead><tr><th>תאריך</th><th>משמרת</th><th>שעות</th><th></th></tr></thead><tbody>'
     + mine.map(function (a) {
       var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
       var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
