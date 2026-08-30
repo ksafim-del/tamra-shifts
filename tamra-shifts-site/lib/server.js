@@ -37,18 +37,22 @@ function serveStatic(req, res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   const full = path.normalize(path.join(PUBLIC_DIR, rel));
   if (!full.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end('forbidden'); return; }
+  // No build/versioning step in this app, so filenames never change between deploys —
+  // without an explicit no-cache header, browsers (mobile especially) can keep serving
+  // a stale app.js/styles.css indefinitely after a new deploy. Always revalidate.
+  const NO_CACHE = 'no-store, no-cache, must-revalidate';
   fs.readFile(full, (err, data) => {
     if (err) {
       // SPA fallback: unknown non-/api routes serve index.html
       fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (err2, data2) => {
         if (err2) { res.writeHead(404); res.end('not found'); return; }
-        res.writeHead(200, { 'Content-Type': MIME['.html'] });
+        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': NO_CACHE });
         res.end(data2);
       });
       return;
     }
     const ext = path.extname(full);
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': NO_CACHE });
     res.end(data);
   });
 }
