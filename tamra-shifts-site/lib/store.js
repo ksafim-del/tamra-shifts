@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS swap_requests (
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
   claimed_by TEXT,
+  date TEXT,
+  shift_template_id TEXT,
   created_at BIGINT NOT NULL,
   resolved_at BIGINT
 );
@@ -108,10 +110,10 @@ const DEFAULT_TEMPLATES = [
   { roleId: 'office', label: 'משרד', start: '08:00', end: '17:00', needed: 2, days: [0,1,2,3,4] },
 ];
 
-// One-time repair for databases created before timestamp columns were widened
-// to BIGINT (millisecond epoch values overflow Postgres's 32-bit INTEGER).
-// Safe to run every startup: ALTER COLUMN TYPE is a no-op once already BIGINT,
-// and each statement is isolated so a failure on one column can't block the rest.
+// One-time repair for databases created before timestamp columns were widened to BIGINT
+// (millisecond epoch values overflow Postgres's 32-bit INTEGER), plus later column additions.
+// Safe to run every startup: each statement is a no-op once already applied, and each is
+// isolated so a failure on one can't block the rest.
 async function migrateTimestampColumns(db) {
   if (db.dialect !== 'postgres') return;
   const alters = [
@@ -121,6 +123,8 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE swap_requests ALTER COLUMN created_at TYPE BIGINT',
     'ALTER TABLE swap_requests ALTER COLUMN resolved_at TYPE BIGINT',
     'ALTER TABLE notifications ALTER COLUMN created_at TYPE BIGINT',
+    'ALTER TABLE swap_requests ADD COLUMN IF NOT EXISTS date TEXT',
+    'ALTER TABLE swap_requests ADD COLUMN IF NOT EXISTS shift_template_id TEXT',
   ];
   for (const s of alters) {
     try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
@@ -161,7 +165,7 @@ function rowToAssignment(r) {
   return { id: r.id, weekStart: r.week_start, date: r.date, shiftTemplateId: r.shift_template_id, employeeId: r.employee_id, noShow: !!r.no_show };
 }
 function rowToSwap(r) {
-  return { id: r.id, assignmentId: r.assignment_id, requesterId: r.requester_id, roleId: r.role_id, kind: r.kind, status: r.status, claimedBy: r.claimed_by || null, createdAt: r.created_at, resolvedAt: r.resolved_at || null };
+  return { id: r.id, assignmentId: r.assignment_id, requesterId: r.requester_id, roleId: r.role_id, kind: r.kind, status: r.status, claimedBy: r.claimed_by || null, createdAt: r.created_at, resolvedAt: r.resolved_at || null, date: r.date || null, shiftTemplateId: r.shift_template_id || null };
 }
 function rowToNotification(r) {
   return { id: r.id, audience: r.audience, employeeId: r.employee_id || null, type: r.type, text: r.text, severity: r.severity, relatedId: r.related_id || null, channels: JSON.parse(r.channels), read: !!r.read, ts: r.created_at };
@@ -307,8 +311,11 @@ function makeStore(db) {
 
     async createSwapRequest(s) {
       const id = uid();
-      await db.run('INSERT INTO swap_requests (id, assignment_id, requester_id, role_id, kind, status, claimed_by, created_at, resolved_at) VALUES (?,?,?,?,?,?,?,?,NULL)',
-        [id, s.assignmentId, s.requesterId, s.roleId, s.kind, 'open', null, Date.now()]);
+      // snapshot the shift's date/template at request time — a claim later re-creates the
+      // assignment row (new id) for the claimer, so this must not depend on that row surviving.
+      const assignment = await this.getAssignment(s.assignmentId);
+      await db.run('INSERT INTO swap_requests (id, assignment_id, requester_id, role_id, kind, status, claimed_by, date, shift_template_id, created_at, resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL)',
+        [id, s.assignmentId, s.requesterId, s.roleId, s.kind, 'open', null, assignment ? assignment.date : null, assignment ? assignment.shiftTemplateId : null, Date.now()]);
       return id;
     },
     async listSwapRequests({ status } = {}) {
