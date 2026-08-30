@@ -279,6 +279,7 @@ function ensureTabData() {
   if (!STATE) return;
   var tab = ui.tab;
   if (tab === 'schedule' || tab === 'myschedule') { if (!CACHE.weeks[ui.currentWeek]) loadWeek(ui.currentWeek); }
+  if (tab === 'overview') { if (!CACHE.weeks[weekKeyOf(todayStr())]) loadWeek(weekKeyOf(todayStr())); if (!CACHE.swaps) loadSwaps(); }
   if (tab === 'employees' && !CACHE.employeesFull) loadEmployeesFull();
   if (tab === 'requests' && !CACHE.swaps) loadSwaps();
   if ((tab === 'myconstraints') && !CACHE.constraints) loadConstraints();
@@ -356,12 +357,48 @@ function overviewHtml() {
   var understaffed = week ? week.understaffed.length : null;
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
-  return '<div class="kpis">'
+  var html = '<div class="kpis">'
     + '<div class="kpi"><div class="num">' + (STATE.employees.filter(function(e){return e.active;}).length) + '</div><div class="lbl">עובדים פעילים</div></div>'
     + '<div class="kpi"><div class="num">' + (understaffed == null ? '—' : understaffed) + '</div><div class="lbl">משמרות חסרות איוש (שבוע נוכחי)</div></div>'
     + '<div class="kpi"><div class="num">' + unread + '</div><div class="lbl">התראות שלא נקראו</div></div>'
-    + '</div>'
-    + '<div class="card"><div class="card-head"><h2>ההודעות האחרונות</h2></div>' + notifListHtml(notifs.slice(0, 8)) + '</div>';
+    + '</div>';
+
+  html += '<div class="card"><div class="card-head"><h2>תקלות לפי יום — ' + weekLabel(wk) + '</h2></div>';
+  if (!week) {
+    html += '<div class="empty">טוען…</div>';
+  } else {
+    var swaps = CACHE.swaps || [];
+    var rows = '';
+    for (var d = 0; d < 7; d++) {
+      var ds = addDays(wk, d);
+      var dow = new Date(ds.split('-').map(Number)[0], ds.split('-').map(Number)[1] - 1, ds.split('-').map(Number)[2]).getDay();
+      var items = [];
+      week.understaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
+        items.push('<span class="understaffed">חסר ' + u.missing + '</span> ' + esc(t ? t.label : ''));
+      });
+      week.assignments.filter(function (a) { return a.date === ds && a.noShow; }).forEach(function (a) {
+        var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
+        items.push('<span class="understaffed">לא הגיע/ה</span> ' + esc(emp ? emp.name : '?') + (t ? ' (' + esc(t.label) + ')' : ''));
+      });
+      week.assignments.filter(function (a) { return a.date === ds; }).forEach(function (a) {
+        var openSwap = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
+        if (openSwap) {
+          var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
+          items.push('<span class="pill status-open">בקשת החלפה פתוחה</span> ' + esc(t ? t.label : ''));
+        }
+      });
+      rows += '<tr><td style="width:120px"><b>' + dowName(dow) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span></td><td>'
+        + (items.length ? items.join('<br>') : '<span style="color:var(--ok)">אין תקלות</span>')
+        + '</td></tr>';
+    }
+    html += '<table><thead><tr><th style="width:120px">יום</th><th>תקלות</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+  html += '</div>';
+
+  html += '<div class="card"><div class="card-head"><h2>ההודעות האחרונות</h2></div>' + notifListHtml(notifs.slice(0, 8)) + '</div>';
+  return html;
 }
 
 function notifListHtml(list) {
@@ -394,24 +431,31 @@ function scheduleHtml() {
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
     + '</div></div>';
 
+  html += '<div class="card"><table><thead><tr><th style="width:110px">יום</th><th>משמרת</th><th style="width:110px">שעות</th><th>עובדים משובצים</th></tr></thead><tbody>';
   for (var d = 0; d < 7; d++) {
     var ds = addDays(wk, d);
     var dow = new Date(ds.split('-').map(Number)[0], ds.split('-').map(Number)[1]-1, ds.split('-').map(Number)[2]).getDay();
     var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; });
-    html += '<div class="day-card"><h4>' + dowName(dow) + ' ' + fmtDateShort(ds) + '</h4>';
-    templates.forEach(function (t) {
+    var dayCell = '<td rowspan="' + Math.max(templates.length, 1) + '" style="vertical-align:top;border-inline-end:1px solid var(--border);"><b>' + dowName(dow) + '</b><br><span class="mono">' + fmtDateShort(ds) + '</span></td>';
+    if (!templates.length) {
+      html += '<tr>' + dayCell + '<td colspan="3" class="empty">אין משמרות מוגדרות ליום זה</td></tr>';
+      continue;
+    }
+    templates.forEach(function (t, ti) {
       var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
       var missing = t.needed - assigned.length;
-      html += '<div class="shift-row"><div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span></div>'
-        + '<div>' + assigned.map(function (a) {
+      html += '<tr>' + (ti === 0 ? dayCell : '')
+        + '<td><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></td>'
+        + '<td class="mono">' + t.start + '–' + t.end + '</td>'
+        + '<td>' + assigned.map(function (a) {
             var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
-            return '<span style="margin-inline-start:8px;">' + esc(emp ? emp.name : '?') + ' <button class="iconbtn" data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
+            return '<span style="margin-inline-end:8px;display:inline-block;">' + esc(emp ? emp.name : '?') + ' <button class="iconbtn" data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
           }).join('')
-        + (missing > 0 ? ('<span class="understaffed" style="margin-inline-start:8px;">חסר ' + missing + '</span> <select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
-        + '</div></div>';
+        + (missing > 0 ? ('<span class="understaffed" style="margin-inline-end:8px;">חסר ' + missing + '</span> <select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
+        + '</td></tr>';
     });
-    html += '</div>';
   }
+  html += '</tbody></table></div>';
   return html;
 }
 
