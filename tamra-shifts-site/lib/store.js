@@ -107,7 +107,7 @@ const DEFAULT_TEMPLATES = [
   { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6] },
   { roleId: 'store', label: 'צהריים חנות', start: '13:00', end: '21:00', needed: 1, days: [0,1,2,3,4,5,6] },
   { roleId: 'store', label: 'לילה חנות', start: '21:00', end: '07:00', needed: 1, days: [0,1,2,3,4,5,6] },
-  { roleId: 'office', label: 'משרד', start: '08:00', end: '17:00', needed: 2, days: [0,1,2,3,4] },
+  // office shifts intentionally not scheduled — see deactivateOfficeTemplates below.
 ];
 
 // One-time repair for databases created before timestamp columns were widened to BIGINT
@@ -131,6 +131,13 @@ async function migrateTimestampColumns(db) {
   }
 }
 
+// The office role is no longer scheduled. Runs every startup, on any database that
+// already seeded the old default templates (including ones created before this
+// change) — idempotent via the "active = 1" guard, so it's a no-op once applied.
+async function deactivateOfficeTemplates(db) {
+  await db.run("UPDATE shift_templates SET active = 0 WHERE role_id = 'office' AND active = 1", []);
+}
+
 async function initSchema(db) {
   const statements = SCHEMA.split(';').map(s => s.trim()).filter(Boolean);
   for (const s of statements) await db.exec(s + ';');
@@ -148,6 +155,7 @@ async function initSchema(db) {
       );
     }
   }
+  await deactivateOfficeTemplates(db);
 }
 
 function rowToEmployee(r, includePin) {
