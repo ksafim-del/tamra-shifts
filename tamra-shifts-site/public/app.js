@@ -360,7 +360,18 @@ function overviewHtml() {
   var understaffed = week ? week.understaffed.length : null;
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
-  var html = '<div class="kpis">'
+  var html = '';
+  if (!STATE.employees.length) {
+    html += '<div class="card"><div class="card-head"><h2>ברוכים הבאים ללוח המשמרות</h2></div>'
+      + '<div class="helpcard"><b>איך מתחילים:</b><ol>'
+      + '<li>מוסיפים את העובדים הראשונים בלשונית <b>עובדים</b> — שם, תפקיד וקוד PIN אישי לכל אחד/ת.</li>'
+      + '<li>כל עובד/ת נכנס/ת דרך אותו קישור בדיוק, בוחר/ת את השם שלו/ה ומקליד/ה את הקוד — ומגיש/ה משם את האילוצים.</li>'
+      + '<li>בלשונית <b>לוז שבועי</b> לוחצים על "הפק לוז" — השיבוץ נעשה אוטומטית לפי האילוצים, בחלוקה הוגנת.</li>'
+      + '</ol></div>'
+      + '<div style="margin-top:14px;"><button class="btn" data-action="set-tab" data-tab="employees">בואו נתחיל — הוספת עובד/ת ראשון/ה</button></div>'
+      + '</div>';
+  }
+  html += '<div class="kpis">'
     + '<div class="kpi"><div class="num">' + (STATE.employees.filter(function(e){return e.active;}).length) + '</div><div class="lbl">עובדים פעילים</div></div>'
     + '<div class="kpi"><div class="num">' + (understaffed == null ? '—' : understaffed) + '</div><div class="lbl">משמרות חסרות איוש (שבוע נוכחי)</div></div>'
     + '<div class="kpi"><div class="num">' + unread + '</div><div class="lbl">התראות שלא נקראו</div></div>'
