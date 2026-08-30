@@ -9,6 +9,7 @@ const actions = require('./actions.js');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const VALID_ROLES = ['fuel', 'store']; // office removed — no shifts are scheduled for it anymore
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -145,12 +146,16 @@ function makeApp(store, opts) {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
     if (!body.name || !body.roleId || !body.pin) return sendJson(res, 400, { error: 'missing_fields' });
+    if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null });
     return sendJson(res, 200, { employee: emp });
   });
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    // Only block switching TO an invalid role; editing other fields on a legacy
+    // (e.g. pre-existing office) employee should not be blocked by this.
+    if (body.roleId && body.roleId !== 'office' && !VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     const emp = await store.updateEmployee(params.id, body);
     if (!emp) return sendJson(res, 404, { error: 'not_found' });
     return sendJson(res, 200, { employee: emp });
