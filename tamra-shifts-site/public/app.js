@@ -14,6 +14,8 @@ function monthLabel(mk){ var p=mk.split('-'); var names=['ינואר','פברו�
 function fmtDateShort(ds){ var p=ds.split('-'); return p[2]+'.'+p[1]; }
 function weekLabel(wk){ var end=addDays(wk,6); return fmtDateShort(wk)+'–'+fmtDateShort(end)+'.'+wk.split('-')[0]; }
 function dowName(n){ return ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'][n]; }
+function dowOfDateStr(ds){ var p=ds.split('-').map(Number); return new Date(p[0],p[1]-1,p[2]).getDay(); }
+function dayDateHtml(ds){ if(!ds) return '—'; return '<b>' + dowName(dowOfDateStr(ds)) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span>'; }
 function nextGenerationWeek(){ return addWeeks(weekKeyOf(todayStr()),1); }
 function deadlineForWeek(weekStart, genDow){ genDow = genDow==null?4:genDow; return addDays(weekStart, genDow-8); }
 function timeToMinutes(t){ var p=t.split(':').map(Number); return p[0]*60+p[1]; }
@@ -92,7 +94,8 @@ function loadConstraints(cb) {
   api('GET', '/api/constraints' + qs).then(function (r) { if (r.ok) CACHE.constraints = r.data.constraints; if (cb) cb(); render(); });
 }
 function loadSwaps(cb) {
-  api('GET', '/api/swaps?status=open').then(function (r) { if (r.ok) CACHE.swaps = r.data.swaps; if (cb) cb(); render(); });
+  // fetch full history (not just open) so resolved requests still show who claimed them
+  api('GET', '/api/swaps').then(function (r) { if (r.ok) CACHE.swaps = r.data.swaps; if (cb) cb(); render(); });
 }
 function loadNotifications(cb) {
   api('GET', '/api/notifications').then(function (r) { if (r.ok) CACHE.notifications = r.data.notifications; if (cb) cb(); render(); });
@@ -371,7 +374,6 @@ function overviewHtml() {
     var rows = '';
     for (var d = 0; d < 7; d++) {
       var ds = addDays(wk, d);
-      var dow = new Date(ds.split('-').map(Number)[0], ds.split('-').map(Number)[1] - 1, ds.split('-').map(Number)[2]).getDay();
       var items = [];
       week.understaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
@@ -397,7 +399,7 @@ function overviewHtml() {
         var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
         return '<span class="mono">' + time + '</span> ' + (n.read ? '' : '<b>') + esc(n.text) + (n.read ? '' : '</b>');
       });
-      rows += '<tr><td style="width:120px"><b>' + dowName(dow) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span></td>'
+      rows += '<tr><td style="width:120px;white-space:nowrap;">' + dayDateHtml(ds) + '</td>'
         + '<td>' + (items.length ? items.join('<br>') : '<span style="color:var(--ok)">אין תקלות</span>') + '</td>'
         + '<td>' + (notifItems.length ? notifItems.join('<br>') : '—') + '</td>'
         + '</tr>';
@@ -443,7 +445,7 @@ function scheduleHtml() {
     var ds = addDays(wk, d);
     var dow = new Date(ds.split('-').map(Number)[0], ds.split('-').map(Number)[1]-1, ds.split('-').map(Number)[2]).getDay();
     var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; });
-    var dayCell = '<td rowspan="' + Math.max(templates.length, 1) + '" style="vertical-align:top;border-inline-end:1px solid var(--border);"><b>' + dowName(dow) + '</b><br><span class="mono">' + fmtDateShort(ds) + '</span></td>';
+    var dayCell = '<td rowspan="' + Math.max(templates.length, 1) + '" style="vertical-align:top;border-inline-end:1px solid var(--border);white-space:nowrap;">' + dayDateHtml(ds) + '</td>';
     if (!templates.length) {
       html += '<tr>' + dayCell + '<td colspan="3" class="empty">אין משמרות מוגדרות ליום זה</td></tr>';
       continue;
@@ -483,11 +485,17 @@ function employeesHtml() {
 /* ---------- requests (manager) ---------- */
 function requestsHtml() {
   var swaps = CACHE.swaps || [];
-  return '<div class="card"><div class="card-head"><h2>בקשות החלפה / הברזה פתוחות</h2></div>'
-    + (swaps.length ? ('<table><thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th>סטטוס</th></tr></thead><tbody>' + swaps.map(function (s) {
+  return '<div class="card"><div class="card-head"><h2>בקשות החלפה / הברזה</h2></div>'
+    + (swaps.length ? ('<table class="xltable"><thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead><tbody>' + swaps.map(function (s) {
         var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
-        return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td><td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td></tr>';
-      }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות פתוחות כרגע</div>')
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
+        var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
+        return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
+          + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
+          + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
+          + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
+          + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td></tr>';
+      }).join('') + '</tbody></table>') : '<div class="empty">אין עדיין בקשות החלפה/הברזה</div>')
     + '</div>'
     + '<div class="card"><div class="card-head"><h2>כל ההתראות למנהל</h2></div>' + notifListHtml(CACHE.notifications || []) + '</div>';
 }
@@ -540,11 +548,12 @@ function myScheduleHtml() {
   var mine = week.assignments.filter(function (a) { return a.employeeId === STATE.me.id; });
   if (!mine.length) { html += '<div class="empty">אין לך משמרות בשבוע זה' + (week.generatedAt ? '' : ' (הלוז עדיין לא הופק)') + '</div></div>'; return html; }
   var swaps = CACHE.swaps || [];
-  html += '<table class="xltable"><thead><tr><th>תאריך</th><th>משמרת</th><th>שעות</th><th></th></tr></thead><tbody>'
+  mine.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  html += '<table class="xltable"><thead><tr><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>שעות</th><th></th></tr></thead><tbody>'
     + mine.map(function (a) {
       var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
       var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
-      return '<tr><td>' + fmtDateShort(a.date) + '</td><td><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></td><td class="mono">' + (t ? t.start + '–' + t.end : '') + '</td>'
+      return '<tr><td style="white-space:nowrap;">' + dayDateHtml(a.date) + '</td><td><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></td><td class="mono">' + (t ? t.start + '–' + t.end : '') + '</td>'
         + '<td>' + (openReq ? '<span class="pill status-open">בקשה פתוחה</span>' : ('<button class="btn secondary sm" data-action="request-swap" data-aid="' + a.id + '">בקש/י החלפה</button> <button class="btn sm danger" data-action="report-noshow" data-aid="' + a.id + '">לא אוכל/ה להגיע</button>')) + '</td></tr>';
     }).join('') + '</tbody></table></div>';
   return html;
@@ -567,11 +576,17 @@ function myConstraintsHtml() {
 function mySwapsHtml() {
   var swaps = (CACHE.swaps || []).filter(function (s) { return s.requesterId === STATE.me.id || s.roleId === STATE.me.roleId; });
   return '<div class="card"><div class="card-head"><h2>החלפות</h2></div>'
-    + (swaps.length ? ('<table><thead><tr><th>מבקש/ת</th><th>סוג</th><th>סטטוס</th><th></th></tr></thead><tbody>' + swaps.map(function (s) {
+    + (swaps.length ? ('<table class="xltable"><thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th></tr></thead><tbody>' + swaps.map(function (s) {
         var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
         var isMine = s.requesterId === STATE.me.id;
-        return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td><td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-          + '<td>' + (!isMine && s.status === 'open' ? ('<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>') : '') + '</td></tr>';
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
+        var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
+        var lastCol = (!isMine && s.status === 'open') ? ('<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>') : (claimer ? ('נלקח ע"י ' + esc(claimer.name)) : '');
+        return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
+          + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
+          + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
+          + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
+          + '<td>' + lastCol + '</td></tr>';
       }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות רלוונטיות כרגע</div>')
     + '</div>';
 }
