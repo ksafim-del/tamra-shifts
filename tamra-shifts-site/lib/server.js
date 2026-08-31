@@ -314,6 +314,13 @@ function makeApp(store, opts) {
     await store.markNotificationRead(params.id);
     return sendJson(res, 200, { ok: true });
   });
+  route('POST', '/api/notifications/read-all', async (req, res) => {
+    const session = await requireSession(req);
+    if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    if (session.type === 'manager') await store.markAllNotificationsRead({ audience: 'manager' });
+    else await store.markAllNotificationsRead({ audience: 'employee', employeeId: session.employeeId });
+    return sendJson(res, 200, { ok: true });
+  });
 
   // ---- cron endpoints (called by Render's scheduled job, not by browsers) ----
   route('POST', '/api/cron/generate-week', async (req, res, params, body, query) => {
