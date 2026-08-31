@@ -213,6 +213,10 @@ function handleAction(action, el, ev) {
     api('POST', '/api/notifications/' + nid + '/read').then(function () { loadNotifications(); });
     return;
   }
+  if (action === 'mark-all-read') {
+    api('POST', '/api/notifications/read-all').then(function (r) { if (r.ok) loadNotifications(); });
+    return;
+  }
 }
 
 function toggleTheme() {
@@ -297,7 +301,7 @@ function ensureTabData() {
   if (tab === 'requests' && !CACHE.swaps) loadSwaps();
   if ((tab === 'requests' || tab === 'myconstraints') && !CACHE.constraints) loadConstraints();
   if ((tab === 'hours' || tab === 'myhours') && !CACHE.hours[ui.currentMonth]) loadHours(ui.currentMonth);
-  if ((tab === 'mynotifs' || tab === 'overview') && !CACHE.notifications) loadNotifications();
+  if ((tab === 'mynotifs' || tab === 'overview' || tab === 'requests') && !CACHE.notifications) loadNotifications();
   if (tab === 'myswaps' && !CACHE.swaps) loadSwaps();
 }
 
@@ -431,13 +435,45 @@ function overviewHtml() {
   return html;
 }
 
+function notifIcon(n) {
+  if (n.severity === 'warning') return '⚠️';
+  if (n.type === 'swap-claimed' || n.type === 'generated') return '✅';
+  if (n.type === 'swap-open') return '🔁';
+  if (n.type === 'understaffed') return '⚠️';
+  return 'ℹ️';
+}
+function notifDayLabel(ts) {
+  var d = new Date(ts);
+  var ds = dateStrOf(d.getFullYear(), d.getMonth() + 1, d.getDate());
+  var t = todayStr();
+  if (ds === t) return 'היום';
+  if (ds === addDays(t, -1)) return 'אתמול';
+  return dowName(dowOfDateStr(ds)) + ', ' + fmtDateShort(ds);
+}
 function notifListHtml(list) {
   if (!list || !list.length) return '<div class="empty">אין התראות</div>';
-  return '<table><tbody>' + list.map(function (n) {
-    return '<tr><td style="width:110px" class="mono">' + new Date(n.ts).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) + '</td>'
-      + '<td>' + (n.read ? '' : '<b>') + esc(n.text).replace(/\n/g, '<br>') + (n.read ? '' : '</b>') + '</td>'
-      + '<td style="width:80px">' + (n.read ? '' : '<button class="iconbtn" data-action="mark-notif-read" data-id="' + n.id + '">סמן כנקרא</button>') + '</td></tr>';
-  }).join('') + '</tbody></table>';
+  var unreadCount = list.filter(function (n) { return !n.read; }).length;
+  var groups = [];
+  var lastLabel = null;
+  list.forEach(function (n) {
+    var label = notifDayLabel(n.ts);
+    if (label !== lastLabel) { groups.push({ label: label, items: [] }); lastLabel = label; }
+    groups[groups.length - 1].items.push(n);
+  });
+  var html = unreadCount
+    ? '<div class="notif-filterbar"><button class="btn secondary sm" data-action="mark-all-read">סמן הכול כנקרא (' + unreadCount + ')</button></div>'
+    : '';
+  html += '<div class="notiflist">' + groups.map(function (g) {
+    return '<div class="notifgroup-label">' + esc(g.label) + '</div>' + g.items.map(function (n) {
+      var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+      return '<div class="notifitem' + (n.read ? '' : ' unread') + (n.severity === 'warning' ? ' sev-warning' : '') + '">'
+        + '<div class="nf-icon">' + notifIcon(n) + '</div>'
+        + '<div class="nf-body"><div class="nf-text">' + esc(n.text).replace(/\n/g, '<br>') + '</div><div class="nf-time">' + time + '</div></div>'
+        + (n.read ? '' : '<button class="iconbtn" data-action="mark-notif-read" data-id="' + n.id + '" title="סמן כנקרא">✓</button>')
+        + '</div>';
+    }).join('');
+  }).join('') + '</div>';
+  return html;
 }
 
 /* ---------- schedule (manager) ---------- */
@@ -461,31 +497,32 @@ function scheduleHtml() {
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
     + '</div></div>';
 
-  html += '<div class="card"><table><thead><tr><th style="width:110px">יום</th><th>משמרת</th><th style="width:110px">שעות</th><th>עובדים משובצים</th></tr></thead><tbody>';
-  for (var d = 0; d < 7; d++) {
+  html += '<div class="card"><div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
     var ds = addDays(wk, d);
-    var dow = new Date(ds.split('-').map(Number)[0], ds.split('-').map(Number)[1]-1, ds.split('-').map(Number)[2]).getDay();
+    var dow = dowOfDateStr(ds);
     var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; });
-    var dayCell = '<td rowspan="' + Math.max(templates.length, 1) + '" style="vertical-align:top;border-inline-end:1px solid var(--border);white-space:nowrap;">' + dayDateHtml(ds) + '</td>';
+    var body;
     if (!templates.length) {
-      html += '<tr>' + dayCell + '<td colspan="3" class="empty">אין משמרות מוגדרות ליום זה</td></tr>';
-      continue;
+      body = '<div class="calday-empty">אין משמרות מוגדרות</div>';
+    } else {
+      body = templates.map(function (t) {
+        var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
+        var missing = t.needed - assigned.length;
+        return '<div class="calevent ' + roleClass(t.roleId) + '">'
+          + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
+          + '<div class="cal-time">' + t.start + '–' + t.end + '</div>'
+          + '<div class="cal-emps">' + assigned.map(function (a) {
+              var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
+              return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
+            }).join('')
+          + (missing > 0 ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
+          + '</div>'
+          + (missing > 0 ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
+          + '</div>';
+      }).join('');
     }
-    templates.forEach(function (t, ti) {
-      var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
-      var missing = t.needed - assigned.length;
-      html += '<tr>' + (ti === 0 ? dayCell : '')
-        + '<td><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></td>'
-        + '<td class="mono">' + t.start + '–' + t.end + '</td>'
-        + '<td>' + assigned.map(function (a) {
-            var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
-            return '<span style="margin-inline-end:8px;display:inline-block;">' + esc(emp ? emp.name : '?') + ' <button class="iconbtn" data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
-          }).join('')
-        + (missing > 0 ? ('<span class="understaffed" style="margin-inline-end:8px;">חסר ' + missing + '</span> <select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
-        + '</td></tr>';
-    });
-  }
-  html += '</tbody></table></div>';
+    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dow) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div>' + body + '</div>';
+  }).join('') + '</div></div>';
   return html;
 }
 
@@ -600,17 +637,30 @@ function myScheduleHtml() {
   var html = '<div class="card"><div class="card-head"><h2>הלוז שלי — ' + weekLabel(wk) + '</h2>'
     + '<div><button class="btn secondary sm" data-action="week-prev">◀</button> <button class="btn secondary sm" data-action="week-next">▶</button></div></div>';
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
+  if (!week.generatedAt) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
   var mine = week.assignments.filter(function (a) { return a.employeeId === STATE.me.id; });
-  if (!mine.length) { html += '<div class="empty">אין לך משמרות בשבוע זה' + (week.generatedAt ? '' : ' (הלוז עדיין לא הופק)') + '</div></div>'; return html; }
   var swaps = CACHE.swaps || [];
-  mine.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
-  html += '<table class="xltable"><thead><tr><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>שעות</th><th></th></tr></thead><tbody>'
-    + mine.map(function (a) {
-      var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
-      var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
-      return '<tr><td style="white-space:nowrap;">' + dayDateHtml(a.date) + '</td><td><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></td><td class="mono">' + (t ? t.start + '–' + t.end : '') + '</td>'
-        + '<td>' + (openReq ? '<span class="pill status-open">בקשה פתוחה</span>' : ('<button class="btn secondary sm" data-action="request-swap" data-aid="' + a.id + '">בקש/י החלפה</button> <button class="btn sm danger" data-action="report-noshow" data-aid="' + a.id + '">לא אוכל/ה להגיע</button>')) + '</td></tr>';
-    }).join('') + '</tbody></table></div>';
+  html += '<div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
+    var ds = addDays(wk, d);
+    var dayAssignments = mine.filter(function (a) { return a.date === ds; });
+    var body;
+    if (!dayAssignments.length) {
+      body = '<div class="calday-empty">אין משמרת</div>';
+    } else {
+      body = dayAssignments.map(function (a) {
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
+        var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
+        return '<div class="calevent ' + roleClass(t ? t.roleId : '') + '">'
+          + '<div><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></div>'
+          + '<div class="cal-time">' + (t ? t.start + '–' + t.end : '') + '</div>'
+          + '<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">' + (openReq
+              ? '<span class="pill status-open">בקשה פתוחה</span>'
+              : ('<button class="btn secondary sm" data-action="request-swap" data-aid="' + a.id + '">בקש/י החלפה</button><button class="btn sm danger" data-action="report-noshow" data-aid="' + a.id + '">לא אוכל/ה להגיע</button>'))
+          + '</div></div>';
+      }).join('');
+    }
+    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dowOfDateStr(ds)) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div>' + body + '</div>';
+  }).join('') + '</div></div>';
   return html;
 }
 
