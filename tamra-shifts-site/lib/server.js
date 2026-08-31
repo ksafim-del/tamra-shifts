@@ -242,6 +242,14 @@ function makeApp(store, opts) {
       return sendJson(res, 200, { ok: true });
     } catch (e) { return sendJson(res, 400, { error: e.message }); }
   });
+  route('DELETE', '/api/swaps/:id', async (req, res, params) => {
+    const session = await requireSession(req);
+    if (!session || session.type !== 'employee') return sendJson(res, 403, { error: 'forbidden' });
+    try {
+      await actions.cancelSwapRequest(store, { swapId: params.id, requesterId: session.employeeId });
+      return sendJson(res, 200, { ok: true });
+    } catch (e) { return sendJson(res, 400, { error: e.message }); }
+  });
 
   // ---- constraints ----
   route('GET', '/api/constraints', async (req, res, params, body, query) => {
