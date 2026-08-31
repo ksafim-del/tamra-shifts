@@ -200,6 +200,14 @@ function handleAction(action, el, ev) {
     });
     return;
   }
+  if (action === 'cancel-swap') {
+    var csid = el.getAttribute('data-id');
+    api('DELETE', '/api/swaps/' + csid).then(function (r) {
+      if (r.ok) { toast('הבקשה בוטלה', 'ok'); CACHE.swaps = null; loadSwaps(); }
+      else toast('לא ניתן היה לבטל את הבקשה', 'err');
+    });
+    return;
+  }
   if (action === 'mark-notif-read') {
     var nid = el.getAttribute('data-id');
     api('POST', '/api/notifications/' + nid + '/read').then(function () { loadNotifications(); });
@@ -287,7 +295,7 @@ function ensureTabData() {
   if (tab === 'overview') { if (!CACHE.weeks[weekKeyOf(todayStr())]) loadWeek(weekKeyOf(todayStr())); if (!CACHE.swaps) loadSwaps(); }
   if (tab === 'employees' && !CACHE.employeesFull) loadEmployeesFull();
   if (tab === 'requests' && !CACHE.swaps) loadSwaps();
-  if ((tab === 'myconstraints') && !CACHE.constraints) loadConstraints();
+  if ((tab === 'requests' || tab === 'myconstraints') && !CACHE.constraints) loadConstraints();
   if ((tab === 'hours' || tab === 'myhours') && !CACHE.hours[ui.currentMonth]) loadHours(ui.currentMonth);
   if ((tab === 'mynotifs' || tab === 'overview') && !CACHE.notifications) loadNotifications();
   if (tab === 'myswaps' && !CACHE.swaps) loadSwaps();
@@ -508,12 +516,22 @@ function swapRowHtml(s) {
 }
 var SWAP_TABLE_HEAD = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead>';
 
+function constraintRowHtml(c) {
+  var emp = STATE.employees.find(function (e) { return e.id === c.employeeId; });
+  return '<tr><td>' + esc(emp ? emp.name : '?') + '</td>'
+    + '<td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td>'
+    + '<td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td>'
+    + '<td>' + (c.allDay ? 'כל היום' : (c.start + '–' + c.end)) + '</td></tr>';
+}
+var CONSTRAINT_TABLE_HEAD = '<thead><tr><th>עובד/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th></tr></thead>';
+
 function requestsHtml() {
   var all = CACHE.swaps || [];
   var open = all.filter(function (s) { return s.status === 'open'; });
   var resolved = all.filter(function (s) { return s.status !== 'open'; });
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
+  var constraints = CACHE.constraints || [];
 
   var html = '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
     + (open.length
@@ -525,6 +543,12 @@ function requestsHtml() {
     + (resolved.length
         ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(swapRowHtml).join('') + '</tbody></table>')
         : '<div class="empty">אין עדיין היסטוריה</div>')
+    + '</div>';
+
+  html += '<div class="card"><div class="card-head"><h2>אילוצים וימי חופש שהוגשו' + (constraints.length ? ' — ' + constraints.length : '') + '</h2></div>'
+    + (constraints.length
+        ? ('<table class="xltable">' + CONSTRAINT_TABLE_HEAD + '<tbody>' + constraints.map(constraintRowHtml).join('') + '</tbody></table>')
+        : '<div class="empty">לא הוגשו אילוצים עדיין</div>')
     + '</div>';
 
   html += '<div class="card"><div class="card-head"><h2>יומן התראות' + (unread ? ' — ' + unread + ' חדשות' : '') + '</h2></div>' + notifListHtml(notifs) + '</div>';
@@ -597,8 +621,8 @@ function myConstraintsHtml() {
   var deadline = deadlineForWeek(target, STATE.settings.weeklyGenerationDow);
   return '<div class="card"><div class="card-head"><h2>האילוצים שלי</h2><button class="btn" data-action="add-constraint">+ הוספת אילוץ</button></div>'
     + '<div class="helpcard">אילוצים לשבוע ' + weekLabel(target) + ' ניתן להגיש עד יום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59. לאחר מכן יש לפנות להנהלה לעדכון ידני.</div>'
-    + (list.length ? ('<table><thead><tr><th>סוג</th><th>מתי</th><th>שעות</th><th></th></tr></thead><tbody>' + list.map(function (c) {
-        return '<tr><td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td><td>' + (c.kind === 'date' ? fmtDateShort(c.date) : dowName(c.dayOfWeek)) + '</td><td>' + (c.allDay ? 'כל היום' : (c.start + '–' + c.end)) + '</td><td><button class="iconbtn" data-action="delete-constraint" data-id="' + c.id + '">מחיקה</button></td></tr>';
+    + (list.length ? ('<table class="xltable"><thead><tr><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th><th></th></tr></thead><tbody>' + list.map(function (c) {
+        return '<tr><td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td><td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td><td>' + (c.allDay ? 'כל היום' : (c.start + '–' + c.end)) + '</td><td><button class="iconbtn" data-action="delete-constraint" data-id="' + c.id + '">מחיקה</button></td></tr>';
       }).join('') + '</tbody></table>') : '<div class="empty">לא הוגשו אילוצים</div>')
     + '</div>';
 }
@@ -612,7 +636,10 @@ function mySwapsHtml() {
         var isMine = s.requesterId === STATE.me.id;
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
         var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
-        var lastCol = (!isMine && s.status === 'open') ? ('<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>') : (claimer ? ('נלקח ע"י ' + esc(claimer.name)) : '');
+        var lastCol = '';
+        if (!isMine && s.status === 'open') lastCol = '<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>';
+        else if (isMine && s.status === 'open') lastCol = '<button class="btn sm danger" data-action="cancel-swap" data-id="' + s.id + '">ביטול בקשה</button>';
+        else if (claimer) lastCol = 'נלקח ע"י ' + esc(claimer.name);
         return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
           + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
           + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
