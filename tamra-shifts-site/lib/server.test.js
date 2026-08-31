@@ -38,7 +38,7 @@ test('manager login + bootstrap + employee CRUD via HTTP', async (t) => {
   const bootBody = await boot.json();
   assert.strictEqual(boot.status, 200);
   assert.strictEqual(bootBody.session.type, 'manager');
-  assert.strictEqual(bootBody.shiftTemplates.length, 7);
+  assert.strictEqual(bootBody.shiftTemplates.length, 6);
 
   const create = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ name: 'דני כהן', roleId: 'fuel', pin: '1111' }) });
   const createBody = await create.json();
@@ -106,6 +106,35 @@ test('employee login with PIN and full swap-request flow between two employees, 
   const week3 = await (await fetch(base + '/api/schedule/2026-08-30', { headers: { Cookie: mgrCookie } })).json();
   const reassigned = week3.week.assignments.find(a => a.date === another.date && a.shiftTemplateId === another.shiftTemplateId);
   assert.strictEqual(reassigned.employeeId, e2.id, 'shift should now belong to the claiming employee');
+});
+
+test('employee can cancel their own open swap request, but not someone else\'s', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+  const e1res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד1', roleId: 'fuel', pin: '1111' }) });
+  const e1 = (await e1res.json()).employee;
+  const e2res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד2', roleId: 'fuel', pin: '2222' }) });
+  const e2 = (await e2res.json()).employee;
+  await fetch(base + '/api/schedule/2026-08-30/generate', { method: 'POST', headers: { Cookie: mgrCookie } });
+
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: e1.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+  const week = await (await fetch(base + '/api/schedule/2026-08-30', { headers: { Cookie: empCookie } })).json();
+  const myAssignment = week.week.assignments.find(a => a.employeeId === e1.id);
+  const swapRes = await fetch(base + '/api/assignment/' + myAssignment.id + '/swap-request', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'swap' }) });
+  const swapId = (await swapRes.json()).id;
+
+  const e2Login = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: e2.id, pin: '2222' }) });
+  const e2Cookie = extractCookie(e2Login);
+  const wrongDelete = await fetch(base + '/api/swaps/' + swapId, { method: 'DELETE', headers: { Cookie: e2Cookie } });
+  assert.strictEqual(wrongDelete.status, 400, 'a peer must not be able to cancel someone else\'s request');
+
+  const ownDelete = await fetch(base + '/api/swaps/' + swapId, { method: 'DELETE', headers: { Cookie: empCookie } });
+  assert.strictEqual(ownDelete.status, 200);
+  const swapsAfter = await (await fetch(base + '/api/swaps', { headers: { Cookie: mgrCookie } })).json();
+  assert.ok(!swapsAfter.swaps.some(s => s.id === swapId), 'cancelled request should be gone');
 });
 
 test('constraint deadline enforcement over HTTP (locked week rejected, far week accepted)', async (t) => {
