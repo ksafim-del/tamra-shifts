@@ -55,20 +55,21 @@ a { color: var(--accent); }
 .topbar .brand { font-weight: 800; font-size: 18px; }
 .topbar .brand small { display: block; font-weight: 400; font-size: 12px; color: var(--text-dim); }
 .tabbar { display: flex; gap: 4px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 8px 16px 0; background: var(--surface); border-bottom: 1px solid var(--border); }
-.tabbar button { border: none; background: none; padding: 12px 16px; font-size: 14px; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; -webkit-tap-highlight-color: transparent; transition: color .15s ease; }
+.tabbar button { border: none; background: none; padding: 12px 16px; font-size: 14px; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; -webkit-tap-highlight-color: transparent; transition: color .15s ease, background .15s ease; display: inline-flex; align-items: center; gap: 6px; touch-action: manipulation; }
 .tabbar button:hover { color: var(--text); }
 .tabbar button.active { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 700; }
+.tabbar button .tab-ic { font-size: 15px; line-height: 1; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; margin: 16px 0; box-shadow: 0 1px 2px rgba(20,15,8,.04), 0 2px 12px rgba(20,15,8,.05); overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 .card-head h2 { margin: 0; font-size: 18px; }
-.btn { display: inline-flex; align-items: center; gap: 6px; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; min-height: 40px; font-size: 14px; font-weight: 600; cursor: pointer; transition: filter .15s ease, transform .05s ease; -webkit-tap-highlight-color: transparent; }
+.btn { display: inline-flex; align-items: center; gap: 6px; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; min-height: 40px; font-size: 14px; font-weight: 600; cursor: pointer; transition: filter .15s ease, transform .05s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .btn:hover { filter: brightness(1.07); }
 .btn:active { transform: translateY(1px); }
 .btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
 .btn.danger { background: var(--err); color: #fff; }
 .btn.sm { padding: 8px 12px; min-height: 34px; font-size: 13px; }
 .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; filter: none; }
-.iconbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; min-height: 32px; font-size: 12px; cursor: pointer; color: var(--text); transition: background .15s ease; -webkit-tap-highlight-color: transparent; }
+.iconbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; min-height: 32px; font-size: 12px; cursor: pointer; color: var(--text); transition: background .15s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .iconbtn:hover { background: var(--surface-2); }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: right; }
@@ -137,6 +138,8 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .cal-chip button { border: none; background: none; cursor: pointer; color: var(--text-dim); font-size: 11px; padding: 0; -webkit-tap-highlight-color: transparent; }
 .calday-empty { color: var(--text-dim); font-size: 12px; text-align: center; padding: 14px 0; }
 .calevent select { width: 100%; margin-top: 6px; font-size: 12px; padding: 6px 8px; min-height: 32px; }
+.card:has(.calgrid) { scroll-snap-type: x proximity; }
+.calday { scroll-snap-align: start; }
 
 /* ---- notifications log ---- */
 .notif-filterbar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
@@ -154,10 +157,30 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .notifitem .iconbtn { flex-shrink: 0; }
 
 @media (max-width: 640px) {
-  .wrap { padding: 0 10px 40px; }
+  .wrap { padding: 0 10px calc(76px + env(safe-area-inset-bottom)); }
   .card { padding: 14px; }
   .topbar .brand { font-size: 16px; }
   .kpi { min-width: 130px; }
   .modal { padding: 16px; max-height: 90vh; }
   .calday { flex-basis: 148px; min-width: 148px; }
+
+  /* app-style bottom tab bar instead of a horizontally-scrolling top strip */
+  .tabbar {
+    position: fixed; inset-inline: 0; bottom: 0; top: auto; z-index: 30;
+    justify-content: space-around; align-items: stretch; gap: 0;
+    padding: 4px 2px calc(4px + env(safe-area-inset-bottom));
+    border-bottom: none; border-top: 1px solid var(--border);
+    box-shadow: 0 -2px 14px rgba(20,15,8,.08);
+    overflow-x: visible;
+  }
+  .tabbar button {
+    flex: 1 1 0; min-width: 0;
+    flex-direction: column; justify-content: center; gap: 2px;
+    padding: 6px 2px; font-size: 10.5px; border-bottom: none; border-radius: 10px;
+  }
+  .tabbar button .tab-ic { font-size: 19px; }
+  .tabbar button .tab-lb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .tabbar button.active { background: var(--surface-2); }
+
+  .toastzone { bottom: calc(84px + env(safe-area-inset-bottom)); }
 }
