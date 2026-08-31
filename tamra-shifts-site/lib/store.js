@@ -261,7 +261,18 @@ function makeStore(db) {
       const row = await db.get('SELECT * FROM schedules WHERE week_start = ?', [weekStart]);
       if (!row) return null;
       const assignments = await db.all('SELECT * FROM assignments WHERE week_start = ?', [weekStart]);
-      return { weekStart, understaffed: JSON.parse(row.understaffed), generatedAt: row.generated_at, assignments: assignments.map(rowToAssignment) };
+      const templateRows = await db.all('SELECT id, active FROM shift_templates', []);
+      const activeById = {};
+      templateRows.forEach(t => { activeById[t.id] = !!t.active; });
+      // Drop stale understaffed entries left over from a shift template that has since been
+      // deactivated/removed (e.g. the old office role) — the "understaffed" list is a snapshot
+      // taken at generation time and never rewritten, so a role removed afterwards would
+      // otherwise keep showing "missing" forever for a week generated before the removal.
+      // A shiftTemplateId we have no record of at all is left in place rather than hidden —
+      // safer to show a possibly-orphaned entry than to silently swallow a real one.
+      const understaffed = JSON.parse(row.understaffed).filter(u =>
+        !Object.prototype.hasOwnProperty.call(activeById, u.shiftTemplateId) || activeById[u.shiftTemplateId]);
+      return { weekStart, understaffed, generatedAt: row.generated_at, assignments: assignments.map(rowToAssignment) };
     },
     async listAllWeekKeys() {
       const rows = await db.all('SELECT week_start FROM schedules ORDER BY week_start ASC', []);
@@ -350,6 +361,10 @@ function makeStore(db) {
       };
       await db.run('UPDATE swap_requests SET status=?, claimed_by=?, resolved_at=? WHERE id=?', [next.status, next.claimed_by, next.resolved_at, id]);
       return this.getSwapRequest(id);
+    },
+    async deleteSwapRequest(id, requesterId) {
+      if (requesterId) return db.run('DELETE FROM swap_requests WHERE id = ? AND requester_id = ?', [id, requesterId]);
+      return db.run('DELETE FROM swap_requests WHERE id = ?', [id]);
     },
 
     async addNotification(n) {
