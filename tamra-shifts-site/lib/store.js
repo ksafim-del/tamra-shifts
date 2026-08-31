@@ -385,6 +385,15 @@ function makeStore(db) {
       return rows.map(rowToNotification);
     },
     async markNotificationRead(id) { await db.run('UPDATE notifications SET read = 1 WHERE id = ?', [id]); },
+    async markAllNotificationsRead({ audience, employeeId } = {}) {
+      if (audience === 'employee' && employeeId) {
+        await db.run("UPDATE notifications SET read = 1 WHERE audience = 'employee' AND employee_id = ? AND read = 0", [employeeId]);
+      } else if (audience) {
+        await db.run('UPDATE notifications SET read = 1 WHERE audience = ? AND read = 0', [audience]);
+      } else {
+        await db.run('UPDATE notifications SET read = 1 WHERE read = 0', []);
+      }
+    },
   };
 }
 
