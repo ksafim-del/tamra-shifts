@@ -26,12 +26,13 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){retu
 // needs to render honestly rather than being silently relabeled as fuel/store.
 function roleClass(id){ return id==='fuel'?'role-fuel':(id==='store'?'role-store':'role-other'); }
 function roleLabel(id){ return id==='fuel'?'מתדלק/ת':(id==='store'?'עובד/ת חנות':'פקיד/ה (הוסר)'); }
+function roleLabelPlural(id){ return id==='fuel'?'מתדלקים':(id==='store'?'עובדי חנות':'אחר'); }
 
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel' };
 
 /* ---------- api ---------- */
 function api(method, path, body) {
@@ -125,6 +126,7 @@ function handleAction(action, el, ev) {
   if (action === 'week-prev') { ui.currentWeek = addWeeks(ui.currentWeek, -1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-next') { ui.currentWeek = addWeeks(ui.currentWeek, 1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-gen-target') { ui.currentWeek = nextGenerationWeek(); render(); loadWeek(ui.currentWeek); return; }
+  if (action === 'set-schedule-role') { ui.scheduleRole = el.getAttribute('data-role'); render(); return; }
   if (action === 'month-prev') { ui.currentMonth = addMonths(ui.currentMonth, -1); render(); loadHours(ui.currentMonth); return; }
   if (action === 'month-next') { ui.currentMonth = addMonths(ui.currentMonth, 1); render(); loadHours(ui.currentMonth); return; }
 
@@ -333,8 +335,8 @@ function loginHtml() {
 function shellHtml() {
   var isMgr = STATE.session.type === 'manager';
   var tabs = isMgr
-    ? [['overview', 'סקירה'], ['schedule', 'לוז שבועי'], ['employees', 'עובדים'], ['requests', 'בקשות'], ['hours', 'דוח שעות'], ['settings', 'הגדרות']]
-    : [['myschedule', 'הלוז שלי'], ['myconstraints', 'האילוצים שלי'], ['myswaps', 'החלפות'], ['myhours', 'השעות שלי'], ['mynotifs', 'התראות']];
+    ? [['overview', 'סקירה', '🏠'], ['schedule', 'לוז שבועי', '📅'], ['employees', 'עובדים', '👥'], ['requests', 'בקשות', '📨'], ['hours', 'דוח שעות', '⏱️'], ['settings', 'הגדרות', '⚙️']]
+    : [['myschedule', 'הלוז שלי', '📅'], ['myconstraints', 'האילוצים שלי', '📝'], ['myswaps', 'החלפות', '🔁'], ['myhours', 'השעות שלי', '⏱️'], ['mynotifs', 'התראות', '🔔']];
   ensureTabDataOnce();
   var body;
   if (isMgr) {
@@ -359,7 +361,7 @@ function shellHtml() {
   }
   return '<div class="topbar"><div class="brand">' + esc(STATE.settings.companyName || 'תמרה') + '<small>' + (isMgr ? 'ממשק ניהול' : esc(STATE.me ? STATE.me.name : '')) + '</small></div>'
     + '<div style="display:flex;gap:8px;"><button class="iconbtn" data-action="theme-toggle">☀︎/☾</button><button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
-    + '<div class="tabbar">' + tabs.map(function (t) { return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '">' + t[1] + '</button>'; }).join('') + '</div>'
+    + '<div class="tabbar">' + tabs.map(function (t) { return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '"><span class="tab-ic">' + t[2] + '</span><span class="tab-lb">' + t[1] + '</span></button>'; }).join('') + '</div>'
     + '<div class="wrap">' + body + '</div>'
     + modalHtml();
 }
@@ -482,16 +484,32 @@ function scheduleHtml() {
   var week = CACHE.weeks[wk];
   var genDow = STATE.settings.weeklyGenerationDow;
   var deadline = deadlineForWeek(nextGenerationWeek(), genDow);
+
+  var roles = [];
+  STATE.shiftTemplates.forEach(function (t) { if (t.active && roles.indexOf(t.roleId) === -1) roles.push(t.roleId); });
+  if (!roles.length) roles = ['fuel', 'store'];
+  if (roles.indexOf(ui.scheduleRole) === -1) ui.scheduleRole = roles[0];
+  var roleFilter = ui.scheduleRole;
+
   var html = '<div class="card"><div class="card-head">'
     + '<h2>לוז שבועי — ' + weekLabel(wk) + '</h2>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn secondary sm" data-action="week-prev">◀ שבוע קודם</button><button class="btn secondary sm" data-action="week-gen-target">שבוע להפקה</button><button class="btn secondary sm" data-action="week-next">שבוע הבא ▶</button></div>'
     + '</div>'
+    + (roles.length > 1
+        ? ('<div class="seg" style="margin-bottom:12px;">' + roles.map(function (r) {
+            return '<button type="button" data-action="set-schedule-role" data-role="' + r + '" class="' + (r === roleFilter ? 'active' : '') + '">' + esc(roleLabelPlural(r)) + '</button>';
+          }).join('') + '</div>')
+        : '')
     + '<div class="helpcard">הפקת הלוז מיועדת ליום חמישי, לשבוע המתחיל ' + weekLabel(nextGenerationWeek()) + '. הגשת אילוצי עובדים לשבוע זה ננעלת ביום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59.</div>';
 
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
 
-  if (week.understaffed && week.understaffed.length) {
-    html += '<div class="banner err">יש ' + week.understaffed.length + ' משמרות ללא איוש מלא השבוע — ראה/י פירוט בכרטיסי הימים למטה וניתן לשבץ ידנית.</div>';
+  var roleUnderstaffed = week.understaffed.filter(function (u) {
+    var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
+    return t && t.roleId === roleFilter;
+  });
+  if (roleUnderstaffed.length) {
+    html += '<div class="banner err">יש ' + roleUnderstaffed.length + ' משמרות ' + esc(roleLabelPlural(roleFilter)) + ' ללא איוש מלא השבוע — ראה/י פירוט בכרטיסי הימים למטה וניתן לשבץ ידנית.</div>';
   }
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
@@ -500,7 +518,7 @@ function scheduleHtml() {
   html += '<div class="card"><div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
     var ds = addDays(wk, d);
     var dow = dowOfDateStr(ds);
-    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; });
+    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.roleId === roleFilter && t.days.indexOf(dow) !== -1; });
     var body;
     if (!templates.length) {
       body = '<div class="calday-empty">אין משמרות מוגדרות</div>';
