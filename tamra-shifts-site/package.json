@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test lib/schedule.test.js lib/store.test.js lib/server.test.js",
+    "test": "node --test lib/schedule.test.js lib/store.test.js lib/server.test.js lib/xlsx-truth.test.js",
     "cron:generate": "node scripts/cron-generate.js"
   },
   "dependencies": {
