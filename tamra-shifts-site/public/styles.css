@@ -111,6 +111,12 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .helpcard b { color: var(--text); }
 .helpcard ol, .helpcard ul { margin: 6px 0 0; padding-inline-start: 20px; }
 .helpcard li { margin: 3px 0; }
+.dropzone { margin-top: 12px; border: 2px dashed var(--border); border-radius: 12px; padding: 30px 16px; text-align: center; color: var(--text-dim); cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.dropzone:hover { border-color: var(--accent); }
+.dropzone.dragover { border-color: var(--accent); background: var(--surface-2); color: var(--text); }
+.dropzone.busy { cursor: default; }
+.dropzone-icon { font-size: 30px; margin-bottom: 8px; }
+.err-msg { color: var(--err); font-size: 13px; margin-top: 8px; }
 .loginwrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
 .loginbox { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 32px; max-width: 380px; width: 100%; box-shadow: 0 4px 24px rgba(20,15,8,.08); }
 .loginbox h1 { text-align: center; margin-top: 0; font-size: 20px; }
