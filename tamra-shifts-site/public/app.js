@@ -30,9 +30,9 @@ function roleLabelPlural(id){ return id==='fuel'?'מתדלקים':(id==='store'?
 
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
-var CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null };
+var CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel' };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'' };
 
 /* ---------- api ---------- */
 function api(method, path, body) {
@@ -79,7 +79,7 @@ function login(mode, employeeId, pin) {
 }
 function logout() {
   api('POST', '/api/logout').then(function () {
-    STATE = null; CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null }; ui.tab = null;
+    STATE = null; CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null }; ui.tab = null;
     api('GET', '/api/public/employees').then(function (pr) { PUBLIC_EMPLOYEES = pr.ok ? pr.data.employees : []; render(); });
   });
 }
@@ -111,6 +111,41 @@ function loadEmployeesFull(cb) {
 }
 function refreshBootstrapEmployees() {
   api('GET', '/api/bootstrap').then(function (r) { if (r.ok) { STATE.employees = r.data.employees; STATE.shiftTemplates = r.data.shiftTemplates; render(); } });
+}
+
+/* ---------- true-hours (.xlsx) upload ---------- */
+function arrayBufferToBase64(buf) {
+  var bytes = new Uint8Array(buf);
+  var binary = '';
+  var chunk = 0x8000;
+  for (var i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  }
+  return btoa(binary);
+}
+function handleTruthFile(file) {
+  if (!file) return;
+  ui.truthBusy = true; ui.truthError = ''; render();
+  var reader = new FileReader();
+  reader.onload = function () {
+    var b64;
+    try { b64 = arrayBufferToBase64(reader.result); } catch (e) {
+      ui.truthBusy = false; ui.truthError = 'שגיאה בקריאת הקובץ'; render(); return;
+    }
+    api('POST', '/api/hours/truth', { fileBase64: b64 }).then(function (r) {
+      ui.truthBusy = false;
+      if (!r.ok) {
+        ui.truthError = (r.data && r.data.error === 'parse_failed')
+          ? 'לא הצלחתי לקרוא את הקובץ — יש לוודא שזהו קובץ האקסל המקורי (דוח סיכום שעות) מהמערכת, בלי לשנות אותו'
+          : 'שגיאה בעיבוד הקובץ';
+        render(); return;
+      }
+      CACHE.truthHours = r.data;
+      render();
+    });
+  };
+  reader.onerror = function () { ui.truthBusy = false; ui.truthError = 'שגיאה בקריאת הקובץ'; render(); };
+  reader.readAsArrayBuffer(file);
 }
 
 /* ---------- actions ---------- */
@@ -219,6 +254,12 @@ function handleAction(action, el, ev) {
     api('POST', '/api/notifications/read-all').then(function (r) { if (r.ok) loadNotifications(); });
     return;
   }
+  if (action === 'open-truth-picker') {
+    var inp = document.getElementById('truthFileInput');
+    if (inp) inp.click();
+    return;
+  }
+  if (action === 'clear-truth-hours') { CACHE.truthHours = null; ui.truthError = ''; render(); return; }
 }
 
 function toggleTheme() {
@@ -292,6 +333,30 @@ document.addEventListener('change', function (e) {
   var el = e.target.closest('[data-action]');
   if (!el) return;
   if (el.getAttribute('data-action') === 'assign-slot') handleAction('assign-slot', el, e);
+  if (el.getAttribute('data-action') === 'truth-file-picked') {
+    var f = el.files && el.files[0];
+    el.value = ''; // allow re-selecting the same file again later
+    handleTruthFile(f);
+  }
+});
+document.addEventListener('dragover', function (e) {
+  var dz = e.target.closest && e.target.closest('[data-dropzone]');
+  if (!dz) return;
+  e.preventDefault();
+  dz.classList.add('dragover');
+});
+document.addEventListener('dragleave', function (e) {
+  var dz = e.target.closest && e.target.closest('[data-dropzone]');
+  if (!dz) return;
+  dz.classList.remove('dragover');
+});
+document.addEventListener('drop', function (e) {
+  var dz = e.target.closest && e.target.closest('[data-dropzone]');
+  if (!dz) return;
+  e.preventDefault();
+  dz.classList.remove('dragover');
+  var files = e.dataTransfer && e.dataTransfer.files;
+  if (files && files.length) handleTruthFile(files[0]);
 });
 
 function ensureTabData() {
@@ -624,6 +689,49 @@ function hoursHtml() {
   });
   html += (rows.length ? ('<table><thead><tr><th>עובד/ת</th><th>רגילות</th><th>נוספות</th><th>לילה</th><th>שבת</th><th>סה"כ</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>') : '<div class="empty">אין נתונים לחודש זה</div>');
   html += '</div>';
+  html += truthDropzoneHtml();
+  return html;
+}
+
+/* ---------- hours (manager): "true" hours from the fingerprint-system .xlsx export ---------- */
+function truthDropzoneHtml() {
+  var html = '<div class="card"><div class="card-head"><h2>דוח שעות אמת</h2>'
+    + (CACHE.truthHours ? '<button class="btn secondary sm" data-action="clear-truth-hours">קובץ חדש</button>' : '')
+    + '</div>'
+    + '<div class="helpcard">גררו לכאן את קובץ האקסל של דוח סיכום השעות שמייצאת מערכת הכניסה־יציאה (טביעת אצבע), ונשווה אותו לעובדים באתר.</div>';
+  if (!CACHE.truthHours) {
+    html += '<div class="dropzone' + (ui.truthBusy ? ' busy' : '') + '" data-dropzone data-action="' + (ui.truthBusy ? '' : 'open-truth-picker') + '">'
+      + '<input type="file" id="truthFileInput" data-action="truth-file-picked" accept=".xlsx" style="display:none">'
+      + (ui.truthBusy
+          ? '<div class="dropzone-icon">⏳</div><div>מעבד את הקובץ…</div>'
+          : '<div class="dropzone-icon">📄</div><div>גררו קובץ אקסל לכאן, או הקליקו לבחירה</div>')
+      + '</div>';
+    if (ui.truthError) html += '<div class="err-msg">' + esc(ui.truthError) + '</div>';
+  } else {
+    html += truthHoursHtml();
+  }
+  html += '</div>';
+  return html;
+}
+
+function truthHoursHtml() {
+  var d = CACHE.truthHours;
+  var matched = (d.matched || []).slice().sort(function (a, b) { return (a.name || '').localeCompare(b.name || '', 'he'); });
+  var unmatched = d.unmatched || [];
+  var html = '<div class="helpcard">קובץ המערכת מכיל רק חלוקה לשעות רגילות ושעות נוספות (שתי דרגות, לפי חוק) — אין בו פירוט נפרד לשעות לילה או שבת, ולכן דוח זה מציג את החלוקה הזו בלבד ולא את חלוקת רגילות/לילה/שבת/נוספות שמופיעה בדוח השעות הרגיל של האתר.</div>';
+  html += matched.length
+    ? ('<table class="xltable"><thead><tr><th>עובד/ת</th><th>ימי עבודה</th><th>רגילות</th><th>נוספות א׳</th><th>נוספות ב׳</th><th>חריגות</th><th>סה"כ בפועל</th></tr></thead><tbody>'
+        + matched.map(function (m) {
+            return '<tr><td>' + esc(m.name) + '</td><td class="mono">' + m.workDays + '</td><td class="mono">' + fmtHours(m.regular) + '</td><td class="mono">' + fmtHours(m.overtimeA) + '</td><td class="mono">' + fmtHours(m.overtimeB) + '</td><td class="mono">' + fmtHours(m.exceptional) + '</td><td class="mono"><b>' + fmtHours(m.totalHours) + '</b></td></tr>';
+          }).join('') + '</tbody></table>')
+    : '<div class="empty">לא נמצאו עובדים תואמים בקובץ</div>';
+  if (unmatched.length) {
+    html += '<div class="card-head" style="margin-top:16px;"><h3>לא זוהו באתר — ' + unmatched.length + '</h3></div>'
+      + '<div class="helpcard">השמות הבאים מופיעים בקובץ אך לא נמצא עובד/ת תואמ/ת פעיל/ה באתר (למשל שם כתוב אחרת). אפשר לתקן את שם העובד/ת בעמוד "עובדים" כך שיתאים בדיוק לשם בקובץ, ואז להעלות את הקובץ שוב.</div>'
+      + '<table class="xltable"><thead><tr><th>שם בקובץ</th><th>ימי עבודה</th><th>סה"כ שעות</th></tr></thead><tbody>'
+      + unmatched.map(function (u) { return '<tr><td>' + esc(u.fileName) + '</td><td class="mono">' + u.workDays + '</td><td class="mono">' + fmtHours(u.totalHours) + '</td></tr>'; }).join('')
+      + '</tbody></table>';
+  }
   return html;
 }
 
