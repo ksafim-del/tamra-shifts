@@ -6,6 +6,7 @@ const { URL } = require('node:url');
 const S = require('./schedule.js');
 const auth = require('./auth.js');
 const actions = require('./actions.js');
+const xlsxTruth = require('./xlsx-truth.js');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -17,13 +18,16 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+// 8MB covers a base64-encoded .xlsx upload (the hours-truth report) comfortably;
+// every other route in this app sends tiny JSON payloads, so this is a shared ceiling, not a per-route budget.
+const MAX_JSON_BODY = 8 * 1024 * 1024;
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
     let size = 0;
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > 1024 * 1024) { reject(new Error('body_too_large')); req.destroy(); return; }
+      if (size > MAX_JSON_BODY) { reject(new Error('body_too_large')); req.destroy(); return; }
       data += chunk;
     });
     req.on('end', () => {
@@ -297,6 +301,34 @@ function makeApp(store, opts) {
       result = result[session.employeeId] ? { [session.employeeId]: result[session.employeeId] } : {};
     }
     return sendJson(res, 200, { hours: result });
+  });
+
+  // ---- hours report: "true" hours from the fingerprint attendance-system .xlsx export ----
+  route('POST', '/api/hours/truth', async (req, res, params, body) => {
+    const session = await requireSession(req);
+    if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    if (!body.fileBase64) return sendJson(res, 400, { error: 'missing_file' });
+    let buf;
+    try { buf = Buffer.from(body.fileBase64, 'base64'); } catch (e) { return sendJson(res, 400, { error: 'invalid_file' }); }
+    let parsed;
+    try { parsed = xlsxTruth.parseTruthWorkbook(buf); }
+    catch (e) { return sendJson(res, 400, { error: 'parse_failed', message: e.message }); }
+
+    const employees = await store.listEmployees();
+    const byName = {};
+    employees.forEach((e) => { byName[xlsxTruth.normalizeName(e.name)] = e; });
+
+    const matched = [], unmatched = [];
+    parsed.employees.forEach((row) => {
+      const emp = byName[xlsxTruth.normalizeName(row.fullName)];
+      const entry = {
+        fileName: row.fullName, workDays: row.workDays, totalHours: row.totalHours,
+        regular: row.regular, overtimeA: row.overtimeA, overtimeB: row.overtimeB, exceptional: row.exceptional,
+      };
+      if (emp) matched.push(Object.assign({ employeeId: emp.id, name: emp.name, roleId: emp.roleId }, entry));
+      else unmatched.push(entry);
+    });
+    return sendJson(res, 200, { sheetUsed: parsed.sheetUsed, matched, unmatched });
   });
 
   // ---- notifications ----
