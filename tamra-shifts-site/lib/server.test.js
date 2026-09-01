@@ -5,6 +5,7 @@ const { makeSqliteAdapter } = require('./db-sqlite.js');
 const { initSchema, makeStore } = require('./store.js');
 const { createServer } = require('./server.js');
 const S = require('./schedule.js');
+const { buildFakeWorkbook, sampleRows } = require('./test-helpers/xlsx-fixture.js');
 
 async function startTestServer() {
   const db = makeSqliteAdapter(':memory:');
@@ -178,4 +179,43 @@ test('hours report buckets are exposed per role via HTTP', async (t) => {
   const anyEmp = Object.values(hours.hours)[0];
   assert.ok(anyEmp);
   assert.ok(Math.abs(anyEmp.total - (anyEmp.regular + anyEmp.overtime + anyEmp.night + anyEmp.shabbat)) < 0.01);
+});
+
+test('POST /api/hours/truth: manager-only, parses the uploaded attendance .xlsx and matches by full name', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+
+  // one employee whose name matches a row in the fixture file, one who doesn't appear in it at all
+  const e1res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'מרווה עאבד', roleId: 'fuel', pin: '1111' }) });
+  const e1 = (await e1res.json()).employee;
+  await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד ללא קובץ', roleId: 'store', pin: '2222' }) });
+
+  const fileBase64 = buildFakeWorkbook('תצורה עשרונית', sampleRows()).toString('base64');
+
+  const noAuth = await fetch(base + '/api/hours/truth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileBase64 }) });
+  assert.strictEqual(noAuth.status, 403); // this route's manager-only gate returns 403 for both "not a manager" and "no session", matching every other manager-only route in this file
+
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: e1.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+  const asEmployee = await fetch(base + '/api/hours/truth', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ fileBase64 }) });
+  assert.strictEqual(asEmployee.status, 403);
+
+  const badFile = await fetch(base + '/api/hours/truth', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ fileBase64: Buffer.from('not a real xlsx').toString('base64') }) });
+  assert.strictEqual(badFile.status, 400);
+  assert.strictEqual((await badFile.json()).error, 'parse_failed');
+
+  const res = await fetch(base + '/api/hours/truth', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ fileBase64 }) });
+  assert.strictEqual(res.status, 200);
+  const body = await res.json();
+  assert.strictEqual(body.sheetUsed, 'תצורה עשרונית');
+  assert.strictEqual(body.matched.length, 1);
+  assert.strictEqual(body.matched[0].employeeId, e1.id);
+  assert.strictEqual(body.matched[0].regular, 126.2);
+  assert.strictEqual(body.matched[0].overtimeA, 2);
+  assert.strictEqual(body.matched[0].overtimeB, 1.52);
+  // the other two file rows (ASAD JERIS, and the row named "עובד לא קיים באתר") have no matching site employee
+  assert.strictEqual(body.unmatched.length, 2);
+  assert.ok(body.unmatched.every((u) => u.fileName !== 'מרווה עאבד'));
 });
