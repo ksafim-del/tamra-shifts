@@ -234,6 +234,36 @@ async function cleanupVerboseUnderstaffedNotifications(db) {
   }
 }
 
+// Before "generated"/"understaffed" notifications became a per-week status that a regeneration
+// replaces (see store.replaceScheduleStatusNotification), every regeneration of the same week
+// just added another row — so a week that was regenerated a few times (manually, or by the
+// automatic Thursday run) has several old status lines still stacked under one day in the
+// overview, even though only the most recent one is still true. This one-time cleanup collapses
+// each week's existing rows down to the latest one, and backfills related_id on the survivor
+// (older rows predate that column being used here, so it's matched by parsing the week out of
+// the text instead) so future regenerations can find and replace it going forward. Safe to run
+// every startup: once a week has at most one row left, there is nothing further to collapse.
+async function dedupeScheduleStatusNotifications(db) {
+  const rows = await db.all(
+    "SELECT id, text FROM notifications WHERE audience = 'manager' AND type IN ('generated','understaffed') ORDER BY created_at ASC",
+    []
+  );
+  const byWeek = {};
+  rows.forEach(row => {
+    const m = row.text.match(/לשבוע (\d{4}-\d{2}-\d{2})/);
+    if (!m) return;
+    (byWeek[m[1]] = byWeek[m[1]] || []).push(row);
+  });
+  for (const week of Object.keys(byWeek)) {
+    const group = byWeek[week];
+    const survivor = group[group.length - 1]; // rows were fetched oldest-first, so the last is the latest
+    for (const row of group) {
+      if (row.id !== survivor.id) await db.run('DELETE FROM notifications WHERE id = ?', [row.id]);
+    }
+    await db.run('UPDATE notifications SET related_id = ? WHERE id = ?', [week, survivor.id]);
+  }
+}
+
 async function initSchema(db) {
   const statements = SCHEMA.split(';').map(s => s.trim()).filter(Boolean);
   for (const s of statements) await db.exec(s + ';');
@@ -255,6 +285,7 @@ async function initSchema(db) {
   await applyScheduleTemplateSpecV2(db);
   await applyScheduleTemplateSpecV3(db);
   await cleanupVerboseUnderstaffedNotifications(db);
+  await dedupeScheduleStatusNotifications(db);
 }
 
 function rowToEmployee(r, includePin) {
@@ -484,6 +515,13 @@ function makeStore(db) {
       await db.run('INSERT INTO notifications (id, audience, employee_id, type, text, severity, related_id, channels, read, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)',
         [id, n.audience, n.employeeId || null, n.type, n.text, n.severity || 'info', n.relatedId || null, JSON.stringify(n.channels || ['inapp']), Date.now()]);
       return id;
+    },
+    // A "generated"/"understaffed" notification is a status for one week, not a log entry —
+    // regenerating the same week (manually via "הפק מחדש", or the automatic Thursday run)
+    // should replace the previous status, not stack another line under it. Called right before
+    // writing the new status notification for weekStart.
+    async replaceScheduleStatusNotification(weekStart) {
+      await db.run("DELETE FROM notifications WHERE audience = 'manager' AND type IN ('generated','understaffed') AND related_id = ?", [weekStart]);
     },
     async listNotifications({ audience, employeeId, limit } = {}) {
       let rows;
