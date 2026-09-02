@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS shift_templates (
   days TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   auto_assign INTEGER NOT NULL DEFAULT 1,
-  required_gender TEXT
+  required_gender TEXT,
+  allow_extra INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS schedules (
   week_start TEXT PRIMARY KEY,
@@ -111,9 +112,10 @@ const DEFAULT_TEMPLATES = [
   { roleId: 'fuel', label: 'בוקר מתדלקים (שבת)', start: '05:00', end: '13:00', needed: 1, days: [6] },
   { roleId: 'fuel', label: 'ביניים מתדלקים (שבת)', start: '09:00', end: '21:00', needed: 1, days: [6] },
   { roleId: 'fuel', label: 'צהריים מתדלקים (שבת)', start: '13:00', end: '23:00', needed: 1, days: [6] },
-  // store morning is manual-only: the slot exists so a manager can staff it by hand, but the
-  // automatic weekly generator never fills it on its own (autoAssign: false).
-  { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6], autoAssign: false },
+  // store morning: the automatic weekly generator fills the one needed slot like any other
+  // shift, but a manager can still add one more person by hand on busier mornings
+  // (allowExtra: true keeps the "+ שיבוץ ידני" option available even once fully staffed).
+  { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6], allowExtra: true },
   { roleId: 'store', label: 'צהריים חנות', start: '13:00', end: '21:00', needed: 1, days: [0,1,2,3,4,5,6] },
   // night store shift is male-only during automatic generation (physical-safety staffing rule);
   // a manager can still manually assign anyone through the "+ שיבוץ ידני" dropdown.
@@ -140,6 +142,7 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS auto_assign INTEGER NOT NULL DEFAULT 1',
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS gender TEXT',
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS required_gender TEXT',
+    'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS allow_extra INTEGER NOT NULL DEFAULT 0',
   ];
   for (const s of alters) {
     try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
@@ -168,8 +171,8 @@ async function applyScheduleTemplateSpecV2(db) {
   async function ensureTemplate(t) {
     if (rows.find(r => r.role_id === t.roleId && r.label === t.label)) return;
     await db.run(
-      'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
-      [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]
+      'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender, allow_extra) VALUES (?,?,?,?,?,?,?,1,?,?,?)',
+      [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null, t.allowExtra ? 1 : 0]
     );
   }
   await ensureTemplate({ roleId: 'fuel', label: 'בוקר מתדלקים (שבת)', start: '05:00', end: '13:00', needed: 1, days: [6] });
@@ -191,6 +194,17 @@ async function applyScheduleTemplateSpecV3(db) {
   const row = await db.get("SELECT id, required_gender FROM shift_templates WHERE role_id = 'store' AND label = 'לילה חנות'", []);
   if (row && row.required_gender !== 'male') {
     await db.run('UPDATE shift_templates SET required_gender = ? WHERE id = ?', ['male', row.id]);
+  }
+}
+
+// Store morning used to be manual-only (V2 above). It's now auto-filled like any other shift,
+// with an extra manual "add one more" option always available for busier mornings — backfills
+// both flags on any database still holding the old manual-only spec. Idempotent: only writes
+// when the row doesn't already match, same pattern as V2/V3.
+async function applyScheduleTemplateSpecV4(db) {
+  const row = await db.get("SELECT id, auto_assign, allow_extra FROM shift_templates WHERE role_id = 'store' AND label = 'בוקר חנות'", []);
+  if (row && (Number(row.auto_assign) !== 1 || Number(row.allow_extra) !== 1)) {
+    await db.run('UPDATE shift_templates SET auto_assign = 1, allow_extra = 1 WHERE id = ?', [row.id]);
   }
 }
 
@@ -276,14 +290,15 @@ async function initSchema(db) {
   if (!tCount || Number(tCount.c) === 0) {
     for (const t of DEFAULT_TEMPLATES) {
       await db.run(
-        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
-        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]
+        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender, allow_extra) VALUES (?,?,?,?,?,?,?,1,?,?,?)',
+        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null, t.allowExtra ? 1 : 0]
       );
     }
   }
   await deactivateOfficeTemplates(db);
   await applyScheduleTemplateSpecV2(db);
   await applyScheduleTemplateSpecV3(db);
+  await applyScheduleTemplateSpecV4(db);
   await cleanupVerboseUnderstaffedNotifications(db);
   await dedupeScheduleStatusNotifications(db);
 }
@@ -294,7 +309,7 @@ function rowToEmployee(r, includePin) {
   return e;
 }
 function rowToTemplate(r) {
-  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign, requiredGender: r.required_gender || null };
+  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign, requiredGender: r.required_gender || null, allowExtra: !!r.allow_extra };
 }
 function rowToConstraint(r) {
   // created_at is a BIGINT column — Postgres' driver returns those as strings (to avoid
@@ -370,8 +385,8 @@ function makeStore(db) {
     },
     async createShiftTemplate(t) {
       const id = uid();
-      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
-        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]);
+      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender, allow_extra) VALUES (?,?,?,?,?,?,?,1,?,?,?)',
+        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null, t.allowExtra ? 1 : 0]);
       return id;
     },
     async updateShiftTemplate(id, patch) {
@@ -387,9 +402,10 @@ function makeStore(db) {
         active: patch.active != null ? (patch.active ? 1 : 0) : cur.active,
         auto_assign: patch.autoAssign != null ? (patch.autoAssign ? 1 : 0) : cur.auto_assign,
         required_gender: patch.requiredGender !== undefined ? (patch.requiredGender || null) : cur.required_gender,
+        allow_extra: patch.allowExtra != null ? (patch.allowExtra ? 1 : 0) : cur.allow_extra,
       };
-      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=?, auto_assign=?, required_gender=? WHERE id=?',
-        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, next.auto_assign, next.required_gender, id]);
+      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=?, auto_assign=?, required_gender=?, allow_extra=? WHERE id=?',
+        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, next.auto_assign, next.required_gender, next.allow_extra, id]);
       return true;
     },
 
