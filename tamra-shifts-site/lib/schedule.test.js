@@ -73,6 +73,30 @@ test('generateSchedule respects cross-week prior assignments for the 24h rule', 
   assert.strictEqual(result.assignments.length, 1); // exactly 24h gap is allowed
 });
 
+test('generateSchedule skips autoAssign:false templates entirely — never filled, never reported understaffed', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'store-morning', roleId: 'store', start: '06:00', end: '13:00', needed: 1, active: true, days: [0,1,2,3,4,5,6], autoAssign: false },
+    { id: 'store-noon', roleId: 'store', start: '13:00', end: '21:00', needed: 1, active: true, days: [0,1,2,3,4,5,6] },
+  ];
+  const employees = [{ id: 'e0', name: 'E0', roleId: 'store', active: true }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, constraints: [], meta, priorAssignments: [] });
+  assert.ok(!result.assignments.some(a => a.shiftTemplateId === 'store-morning'), 'manual-only template must never be auto-filled');
+  assert.ok(!result.understaffed.some(u => u.shiftTemplateId === 'store-morning'), 'manual-only template must never be flagged understaffed');
+  assert.strictEqual(result.assignments.filter(a => a.shiftTemplateId === 'store-noon').length, 7, 'the auto-assign template still gets filled normally');
+});
+
+test('generateSchedule only applies a Saturday-only template (days:[6]) on Saturday', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-sat-mid', roleId: 'fuel', start: '09:00', end: '21:00', needed: 1, active: true, days: [6] },
+  ];
+  const employees = [{ id: 'e0', name: 'E0', roleId: 'fuel', active: true }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, constraints: [], meta, priorAssignments: [] }); // week of Sun 2026-08-30
+  assert.strictEqual(result.assignments.length, 1);
+  assert.strictEqual(result.assignments[0].date, '2026-09-05'); // the Saturday of that week
+});
+
 test('computeMonthlyHours buckets sum to total and shabbat/night take priority', () => {
   const meta = { nightStart: '22:00', nightEnd: '06:00', shabbatStartDay: 5, shabbatStartTime: '16:00', shabbatEndDay: 6, shabbatEndTime: '20:00', dailyOvertimeThreshold: 8 };
   const templatesById = { 'fuel-night': { id: 'fuel-night', start: '21:00', end: '05:00' } };
