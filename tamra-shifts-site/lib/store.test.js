@@ -25,7 +25,8 @@ test('initSchema seeds default settings and the 10 shift templates from spec (no
   assert.strictEqual(satMiddle.start, '09:00');
   assert.strictEqual(satMiddle.end, '21:00');
   const storeMorning = templates.find(t => t.roleId === 'store' && t.label === 'בוקר חנות');
-  assert.strictEqual(storeMorning.autoAssign, false, 'store morning is manual-only');
+  assert.strictEqual(storeMorning.autoAssign, true, 'store morning is auto-filled like any other shift');
+  assert.strictEqual(storeMorning.allowExtra, true, 'store morning always keeps the manual "add one more" option');
   const storeMiddle = templates.find(t => t.label === 'ביניים חנות');
   assert.deepStrictEqual(storeMiddle.days.slice().sort(), [2,6]);
   assert.ok(!templates.some(t => t.roleId === 'office'), 'office shifts should not be seeded');
@@ -53,6 +54,32 @@ test('applyScheduleTemplateSpecV3 backfills required_gender=male onto a pre-exis
   await initSchema(db); // idempotency: running it again must not error or change anything further
   templates = await store.listShiftTemplates();
   assert.strictEqual(templates.find(t => t.id === row.id).requiredGender, 'male');
+});
+
+test('applyScheduleTemplateSpecV4 backfills auto_assign+allow_extra onto a pre-existing manual-only store morning template', async () => {
+  const db = makeSqliteAdapter(':memory:');
+  await initSchema(db);
+  const store = makeStore(db);
+  // simulate a database still on the old manual-only spec (as V2 used to leave it)
+  const row = await db.get("SELECT id FROM shift_templates WHERE role_id = 'store' AND label = 'בוקר חנות'", []);
+  await db.run('UPDATE shift_templates SET auto_assign = 0, allow_extra = 0 WHERE id = ?', [row.id]);
+  let templates = await store.listShiftTemplates();
+  let t = templates.find(tt => tt.id === row.id);
+  assert.strictEqual(t.autoAssign, false, 'sanity: reset to manual-only for the test');
+  assert.strictEqual(t.allowExtra, false, 'sanity: reset for the test');
+
+  await initSchema(db); // simulates a redeploy startup
+
+  templates = await store.listShiftTemplates();
+  t = templates.find(tt => tt.id === row.id);
+  assert.strictEqual(t.autoAssign, true, 'store morning is auto-filled again');
+  assert.strictEqual(t.allowExtra, true, 'the manual "add one more" option stays available');
+
+  await initSchema(db); // idempotency
+  templates = await store.listShiftTemplates();
+  t = templates.find(tt => tt.id === row.id);
+  assert.strictEqual(t.autoAssign, true);
+  assert.strictEqual(t.allowExtra, true);
 });
 
 test('cleanupVerboseUnderstaffedNotifications rewrites an old-format notification to the short summary, and leaves a short one alone', async () => {
@@ -153,7 +180,11 @@ test('applyScheduleTemplateSpecV2 migrates a pre-existing (old-shape) database o
   assert.deepStrictEqual(morning.days, [0,1,2,3,4,5], 'fuel morning drops Saturday');
   assert.deepStrictEqual(afternoon.days, [0,1,2,3,4,5], 'fuel afternoon drops Saturday');
   assert.deepStrictEqual(night.days, [0,1,2,3,4,5,6], 'fuel night is untouched, still covers Saturday');
-  assert.strictEqual(storeMorning.autoAssign, false, 'store morning becomes manual-only');
+  // V2 sets store morning manual-only, but V4 (which always runs right after in the same
+  // initSchema call) brings it back to auto-filled with an extra manual-add option — so the
+  // end state after a real startup is the current spec, not V2's intermediate one.
+  assert.strictEqual(storeMorning.autoAssign, true, 'store morning ends up auto-filled (current spec, via V4)');
+  assert.strictEqual(storeMorning.allowExtra, true);
 
   const satMorning = templates.find(t => t.roleId === 'fuel' && t.label === 'בוקר מתדלקים (שבת)');
   const satMiddle = templates.find(t => t.roleId === 'fuel' && t.label === 'ביניים מתדלקים (שבת)');
