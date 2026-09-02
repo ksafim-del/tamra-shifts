@@ -29,6 +29,104 @@ test('initSchema seeds default settings and the 10 shift templates from spec (no
   const storeMiddle = templates.find(t => t.label === 'ביניים חנות');
   assert.deepStrictEqual(storeMiddle.days.slice().sort(), [2,6]);
   assert.ok(!templates.some(t => t.roleId === 'office'), 'office shifts should not be seeded');
+  const storeNight = templates.find(t => t.roleId === 'store' && t.label === 'לילה חנות');
+  assert.strictEqual(storeNight.requiredGender, 'male', 'store night shift is male-only in generation');
+  const fuelNight = templates.find(t => t.roleId === 'fuel' && t.label === 'לילה מתדלקים');
+  assert.strictEqual(fuelNight.requiredGender, null, 'no gender restriction on other shifts');
+});
+
+test('applyScheduleTemplateSpecV3 backfills required_gender=male onto a pre-existing store night template', async () => {
+  const db = makeSqliteAdapter(':memory:');
+  await initSchema(db);
+  const store = makeStore(db);
+  // simulate a database seeded before this rule existed: store night present, no required_gender
+  const row = await db.get("SELECT id FROM shift_templates WHERE role_id = 'store' AND label = 'לילה חנות'", []);
+  await db.run('UPDATE shift_templates SET required_gender = NULL WHERE id = ?', [row.id]);
+  let templates = await store.listShiftTemplates();
+  assert.strictEqual(templates.find(t => t.id === row.id).requiredGender, null, 'sanity: cleared for the test');
+
+  await initSchema(db); // simulates a redeploy startup
+
+  templates = await store.listShiftTemplates();
+  assert.strictEqual(templates.find(t => t.id === row.id).requiredGender, 'male');
+
+  await initSchema(db); // idempotency: running it again must not error or change anything further
+  templates = await store.listShiftTemplates();
+  assert.strictEqual(templates.find(t => t.id === row.id).requiredGender, 'male');
+});
+
+test('cleanupVerboseUnderstaffedNotifications rewrites an old-format notification to the short summary, and leaves a short one alone', async () => {
+  const db = makeSqliteAdapter(':memory:');
+  await initSchema(db);
+  const store = makeStore(db);
+  // exact shape the old (pre-fix) notification code used to write: one line per missing slot
+  const oldText = 'הלוז לשבוע 2026-08-30 הופק אך יש משמרות לא מאוישות:\n'
+    + '2026-08-30 לילה מתדלקים (21:00-05:00) — חסרים 1\n'
+    + '2026-08-30 לילה חנות (21:00-07:00) — חסרים 1\n'
+    + '2026-08-31 צהריים מתדלקים (13:00-21:00) — חסרים 2';
+  const oldId = await store.addNotification({ audience: 'manager', type: 'understaffed', text: oldText, severity: 'warning' });
+  const alreadyShortId = await store.addNotification({ audience: 'manager', type: 'understaffed', text: 'הלוז לשבוע 2026-09-06 הופק — 3 משמרות ללא איוש (2 מתדלקים, 1 עובדי חנות). לפירוט מלא: לשונית "לוז שבועי".', severity: 'warning' });
+
+  await initSchema(db); // simulates a redeploy startup with the cleanup migration now present
+
+  const notifs = await store.listNotifications({ audience: 'manager' });
+  const rewritten = notifs.find(n => n.id === oldId);
+  assert.ok(rewritten.text.indexOf('\n') === -1, 'no more multi-line dump');
+  assert.strictEqual(rewritten.text, 'הלוז לשבוע 2026-08-30 הופק — 4 משמרות ללא איוש (3 מתדלקים, 1 עובדי חנות). לפירוט מלא: לשונית "לוז שבועי".');
+  const untouched = notifs.find(n => n.id === alreadyShortId);
+  assert.strictEqual(untouched.text, 'הלוז לשבוע 2026-09-06 הופק — 3 משמרות ללא איוש (2 מתדלקים, 1 עובדי חנות). לפירוט מלא: לשונית "לוז שבועי".', 'already-short notifications are left alone');
+
+  await initSchema(db); // idempotency: nothing left to rewrite
+  const notifs2 = await store.listNotifications({ audience: 'manager' });
+  assert.strictEqual(notifs2.find(n => n.id === oldId).text, rewritten.text);
+});
+
+test('dedupeScheduleStatusNotifications collapses old stacked-up regeneration rows for the same week down to the latest, and backfills related_id', async () => {
+  const db = makeSqliteAdapter(':memory:');
+  await initSchema(db);
+  const store = makeStore(db);
+  // simulate three pre-fix rows for the same week, left over from three separate regenerations,
+  // none of them carrying related_id (that column wasn't populated for these types yet)
+  await db.run('INSERT INTO notifications (id, audience, employee_id, type, text, severity, related_id, channels, read, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)',
+    ['n1', 'manager', null, 'understaffed', 'הלוז לשבוע 2026-08-30 הופק — 5 משמרות ללא איוש (5 מתדלקים). לפירוט מלא: לשונית "לוז שבועי".', 'warning', null, '["inapp"]', 1000]);
+  await db.run('INSERT INTO notifications (id, audience, employee_id, type, text, severity, related_id, channels, read, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)',
+    ['n2', 'manager', null, 'understaffed', 'הלוז לשבוע 2026-08-30 הופק — 2 משמרות ללא איוש (2 מתדלקים). לפירוט מלא: לשונית "לוז שבועי".', 'warning', null, '["inapp"]', 2000]);
+  await db.run('INSERT INTO notifications (id, audience, employee_id, type, text, severity, related_id, channels, read, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)',
+    ['n3', 'manager', null, 'generated', 'הלוז לשבוע 2026-08-30 הופק בהצלחה, כל המשמרות מאוישות.', 'info', null, '["inapp"]', 3000]);
+  // an unrelated week's single row must be left alone
+  await db.run('INSERT INTO notifications (id, audience, employee_id, type, text, severity, related_id, channels, read, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)',
+    ['n4', 'manager', null, 'generated', 'הלוז לשבוע 2026-09-06 הופק בהצלחה, כל המשמרות מאוישות.', 'info', null, '["inapp"]', 4000]);
+
+  await initSchema(db); // simulates a redeploy startup with the dedupe migration now present
+
+  const notifs = await store.listNotifications({ audience: 'manager' });
+  const forThatWeek = notifs.filter(n => n.text.indexOf('לשבוע 2026-08-30') !== -1);
+  assert.strictEqual(forThatWeek.length, 1, 'only the latest regeneration status survives');
+  assert.strictEqual(forThatWeek[0].id, 'n3', 'the most recently created row is the one kept');
+  assert.strictEqual(forThatWeek[0].relatedId, '2026-08-30', 'related_id backfilled so future regenerations can replace it');
+  const otherWeek = notifs.find(n => n.id === 'n4');
+  assert.strictEqual(otherWeek.relatedId, '2026-09-06', 'untouched single row still gets related_id backfilled');
+
+  await initSchema(db); // idempotency: nothing left to collapse
+  const notifs2 = await store.listNotifications({ audience: 'manager' });
+  assert.strictEqual(notifs2.filter(n => n.text.indexOf('לשבוע 2026-08-30') !== -1).length, 1);
+});
+
+test('generateWeek replaces the previous status notification instead of stacking a new one on regeneration', async () => {
+  const store = await freshStore();
+  const { generateWeek } = require('./actions.js');
+
+  await generateWeek(store, '2026-09-13', { force: true });
+  const first = await store.listNotifications({ audience: 'manager' });
+  assert.strictEqual(first.length, 1, 'first generation writes exactly one status notification');
+  const firstText = first[0].text;
+
+  await generateWeek(store, '2026-09-13', { force: true });
+  const second = await store.listNotifications({ audience: 'manager' });
+  assert.strictEqual(second.length, 1, 'regenerating the same week replaces the status instead of adding another');
+  assert.strictEqual(second[0].relatedId, '2026-09-13');
+  assert.strictEqual(second[0].text, firstText, 'same inputs regenerate the same status text');
+  assert.notStrictEqual(second[0].id, first[0].id, 'it really is a fresh row, not a leftover mutated in place');
 });
 
 test('applyScheduleTemplateSpecV2 migrates a pre-existing (old-shape) database on next startup', async () => {
