@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS shift_templates (
   needed INTEGER NOT NULL,
   days TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
-  auto_assign INTEGER NOT NULL DEFAULT 1
+  auto_assign INTEGER NOT NULL DEFAULT 1,
+  required_gender TEXT
 );
 CREATE TABLE IF NOT EXISTS schedules (
   week_start TEXT PRIMARY KEY,
@@ -114,7 +115,9 @@ const DEFAULT_TEMPLATES = [
   // automatic weekly generator never fills it on its own (autoAssign: false).
   { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6], autoAssign: false },
   { roleId: 'store', label: 'צהריים חנות', start: '13:00', end: '21:00', needed: 1, days: [0,1,2,3,4,5,6] },
-  { roleId: 'store', label: 'לילה חנות', start: '21:00', end: '07:00', needed: 1, days: [0,1,2,3,4,5,6] },
+  // night store shift is male-only during automatic generation (physical-safety staffing rule);
+  // a manager can still manually assign anyone through the "+ שיבוץ ידני" dropdown.
+  { roleId: 'store', label: 'לילה חנות', start: '21:00', end: '07:00', needed: 1, days: [0,1,2,3,4,5,6], requiredGender: 'male' },
   { roleId: 'store', label: 'ביניים חנות', start: '10:00', end: '17:00', needed: 1, days: [2,6] }, // Tuesday + Saturday
   // office shifts intentionally not scheduled — see deactivateOfficeTemplates below.
 ];
@@ -136,6 +139,7 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE swap_requests ADD COLUMN IF NOT EXISTS shift_template_id TEXT',
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS auto_assign INTEGER NOT NULL DEFAULT 1',
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS gender TEXT',
+    'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS required_gender TEXT',
   ];
   for (const s of alters) {
     try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
@@ -164,8 +168,8 @@ async function applyScheduleTemplateSpecV2(db) {
   async function ensureTemplate(t) {
     if (rows.find(r => r.role_id === t.roleId && r.label === t.label)) return;
     await db.run(
-      'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
-      [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]
+      'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
+      [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]
     );
   }
   await ensureTemplate({ roleId: 'fuel', label: 'בוקר מתדלקים (שבת)', start: '05:00', end: '13:00', needed: 1, days: [6] });
@@ -177,6 +181,16 @@ async function applyScheduleTemplateSpecV2(db) {
   const storeMorning = rows.find(r => r.role_id === 'store' && r.label === 'בוקר חנות');
   if (storeMorning && Number(storeMorning.auto_assign) !== 0) {
     await db.run('UPDATE shift_templates SET auto_assign = 0 WHERE id = ?', [storeMorning.id]);
+  }
+}
+
+// Store night shifts are male-only during automatic generation (a staffing-safety rule) —
+// backfills required_gender on any database that already seeded the store night template
+// before this rule existed. Idempotent: only writes when not already set, same pattern as V2.
+async function applyScheduleTemplateSpecV3(db) {
+  const row = await db.get("SELECT id, required_gender FROM shift_templates WHERE role_id = 'store' AND label = 'לילה חנות'", []);
+  if (row && row.required_gender !== 'male') {
+    await db.run('UPDATE shift_templates SET required_gender = ? WHERE id = ?', ['male', row.id]);
   }
 }
 
@@ -199,13 +213,14 @@ async function initSchema(db) {
   if (!tCount || Number(tCount.c) === 0) {
     for (const t of DEFAULT_TEMPLATES) {
       await db.run(
-        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
-        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]
+        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
+        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]
       );
     }
   }
   await deactivateOfficeTemplates(db);
   await applyScheduleTemplateSpecV2(db);
+  await applyScheduleTemplateSpecV3(db);
 }
 
 function rowToEmployee(r, includePin) {
@@ -214,7 +229,7 @@ function rowToEmployee(r, includePin) {
   return e;
 }
 function rowToTemplate(r) {
-  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign };
+  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign, requiredGender: r.required_gender || null };
 }
 function rowToConstraint(r) {
   // created_at is a BIGINT column — Postgres' driver returns those as strings (to avoid
@@ -290,8 +305,8 @@ function makeStore(db) {
     },
     async createShiftTemplate(t) {
       const id = uid();
-      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
-        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]);
+      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign, required_gender) VALUES (?,?,?,?,?,?,?,1,?,?)',
+        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1, t.requiredGender || null]);
       return id;
     },
     async updateShiftTemplate(id, patch) {
@@ -306,9 +321,10 @@ function makeStore(db) {
         days: patch.days != null ? JSON.stringify(patch.days) : cur.days,
         active: patch.active != null ? (patch.active ? 1 : 0) : cur.active,
         auto_assign: patch.autoAssign != null ? (patch.autoAssign ? 1 : 0) : cur.auto_assign,
+        required_gender: patch.requiredGender !== undefined ? (patch.requiredGender || null) : cur.required_gender,
       };
-      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=?, auto_assign=? WHERE id=?',
-        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, next.auto_assign, id]);
+      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=?, auto_assign=?, required_gender=? WHERE id=?',
+        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, next.auto_assign, next.required_gender, id]);
       return true;
     },
 
