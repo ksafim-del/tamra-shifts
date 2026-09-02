@@ -618,6 +618,7 @@ function scheduleHtml() {
       body = templates.map(function (t) {
         var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
         var missing = t.needed - assigned.length;
+        var manualOnly = t.autoAssign === false; // e.g. store morning: never auto-filled, never "missing" — just an optional manual add
         return '<div class="calevent ' + roleClass(t.roleId) + '">'
           + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
           + '<div class="cal-time">' + t.start + '–' + t.end + '</div>'
@@ -625,7 +626,7 @@ function scheduleHtml() {
               var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
               return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
             }).join('')
-          + (missing > 0 ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
+          + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
           + '</div>'
           + (missing > 0 ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
           + '</div>';
