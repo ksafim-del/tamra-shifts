@@ -181,10 +181,6 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .chip { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
 .chip.chip-err { background: #fbdcd6; color: #7a2214; }
 .chip.chip-open { background: #fdeccb; color: #7a4a0c; }
-.agenda-notifs { margin-top: 9px; display: flex; flex-direction: column; gap: 5px; border-top: 1px dashed var(--border); padding-top: 8px; }
-.agenda-notif { font-size: 13px; color: var(--text-dim); }
-.agenda-notif .mono { margin-inline-end: 6px; }
-.agenda-notif.unread { color: var(--text); font-weight: 600; }
 
 /* ---- notifications log ---- */
 .notif-filterbar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
