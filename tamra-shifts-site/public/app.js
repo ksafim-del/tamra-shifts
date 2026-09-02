@@ -460,7 +460,23 @@ function ensureTabDataOnce() { if (_lastEnsuredTab !== ui.tab) { _lastEnsuredTab
 function overviewHtml() {
   var wk = weekKeyOf(todayStr());
   var week = CACHE.weeks[wk];
-  var understaffed = week ? week.understaffed.length : null;
+  // Recomputed live from the current assignments — not week.understaffed, which is a snapshot
+  // frozen at generation time. Without this, fixing a gap with a manual assignment on the
+  // schedule tab would leave a stale "missing" flag showing here forever.
+  var liveUnderstaffed = [];
+  if (week) {
+    STATE.shiftTemplates.forEach(function (t) {
+      if (!t.active || t.autoAssign === false) return;
+      for (var dd = 0; dd < 7; dd++) {
+        var dds = addDays(wk, dd);
+        if (t.days.indexOf(dowOfDateStr(dds)) === -1) continue;
+        var assignedCount = week.assignments.filter(function (a) { return a.date === dds && a.shiftTemplateId === t.id; }).length;
+        var missingCount = t.needed - assignedCount;
+        if (missingCount > 0) liveUnderstaffed.push({ date: dds, shiftTemplateId: t.id, missing: missingCount, start: t.start });
+      }
+    });
+  }
+  var understaffed = week ? liveUnderstaffed.length : null;
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
   var html = '';
@@ -488,27 +504,31 @@ function overviewHtml() {
     var dayHtml = '';
     for (var d = 0; d < 7; d++) {
       var ds = addDays(wk, d);
-      var chips = [];
-      week.understaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
+      // { start: minutes-since-midnight, html } so every issue on the day — understaffed,
+      // no-shows, open swaps — lines up in one earliest-to-latest order, like the schedule tab.
+      var issues = [];
+      liveUnderstaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
-        chips.push('<span class="chip chip-err">חסר ' + u.missing + ' — ' + esc(t ? t.label : '') + '</span>');
+        issues.push({ start: t ? timeToMinutes(t.start) : 0, html: '<span class="chip chip-err">חסר ' + u.missing + ' — ' + esc(t ? t.label : '') + '</span>' });
       });
       week.assignments.filter(function (a) { return a.date === ds && a.noShow; }).forEach(function (a) {
         var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
-        chips.push('<span class="chip chip-err">לא הגיע/ה — ' + esc(emp ? emp.name : '?') + (t ? ' (' + esc(t.label) + ')' : '') + '</span>');
+        issues.push({ start: t ? timeToMinutes(t.start) : 0, html: '<span class="chip chip-err">לא הגיע/ה — ' + esc(emp ? emp.name : '?') + (t ? ' (' + esc(t.label) + ')' : '') + '</span>' });
       });
       week.assignments.filter(function (a) { return a.date === ds; }).forEach(function (a) {
         var openSwap = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
         if (openSwap) {
           var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
-          chips.push('<span class="chip chip-open">בקשת החלפה פתוחה — ' + esc(t ? t.label : '') + '</span>');
+          issues.push({ start: t ? timeToMinutes(t.start) : 0, html: '<span class="chip chip-open">בקשת החלפה פתוחה — ' + esc(t ? t.label : '') + '</span>' });
         }
       });
+      issues.sort(function (a, b) { return a.start - b.start; });
+      var chips = issues.map(function (i) { return i.html; });
       var dayNotifs = notifs.filter(function (n) {
         var nd = new Date(n.ts);
         return dateStrOf(nd.getFullYear(), nd.getMonth() + 1, nd.getDate()) === ds;
-      });
+      }).slice().sort(function (a, b) { return a.ts - b.ts; }); // chronological within the day
       var notifRows = dayNotifs.map(function (n) {
         var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
         return '<div class="agenda-notif' + (n.read ? '' : ' unread') + '"><span class="mono">' + time + '</span> ' + esc(n.text) + '</div>';
@@ -610,7 +630,8 @@ function scheduleHtml() {
   html += '<div class="card"><div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
     var ds = addDays(wk, d);
     var dow = dowOfDateStr(ds);
-    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.roleId === roleFilter && t.days.indexOf(dow) !== -1; });
+    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.roleId === roleFilter && t.days.indexOf(dow) !== -1; })
+      .sort(function (a, b) { return timeToMinutes(a.start) - timeToMinutes(b.start); }); // earliest shift first
     var body;
     if (!templates.length) {
       body = '<div class="calday-empty">אין משמרות מוגדרות</div>';
@@ -621,7 +642,7 @@ function scheduleHtml() {
         var manualOnly = t.autoAssign === false; // e.g. store morning: never auto-filled, never "missing" — just an optional manual add
         return '<div class="calevent ' + roleClass(t.roleId) + '">'
           + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
-          + '<div class="cal-time">' + t.start + '–' + t.end + '</div>'
+          + '<div class="cal-time mono">' + t.start + '–' + t.end + '</div>'
           + '<div class="cal-emps">' + assigned.map(function (a) {
               var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
               return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
@@ -677,7 +698,7 @@ function constraintRowHtml(c) {
   return '<tr><td>' + esc(emp ? emp.name : '?') + '</td>'
     + '<td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td>'
     + '<td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td>'
-    + '<td>' + (c.allDay ? 'כל היום' : (c.start + '–' + c.end)) + '</td></tr>';
+    + '<td>' + (c.allDay ? 'כל היום' : ('<span class="mono">' + c.start + '–' + c.end + '</span>')) + '</td></tr>';
 }
 var CONSTRAINT_TABLE_HEAD = '<thead><tr><th>עובד/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th></tr></thead>';
 
@@ -804,7 +825,11 @@ function myScheduleHtml() {
   var swaps = CACHE.swaps || [];
   html += '<div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
     var ds = addDays(wk, d);
-    var dayAssignments = mine.filter(function (a) { return a.date === ds; });
+    var dayAssignments = mine.filter(function (a) { return a.date === ds; }).sort(function (a, b) {
+      var ta = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
+      var tb = STATE.shiftTemplates.find(function (tt) { return tt.id === b.shiftTemplateId; });
+      return timeToMinutes(ta ? ta.start : '00:00') - timeToMinutes(tb ? tb.start : '00:00');
+    });
     var body;
     if (!dayAssignments.length) {
       body = '<div class="calday-empty">אין משמרת</div>';
@@ -814,7 +839,7 @@ function myScheduleHtml() {
         var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
         return '<div class="calevent ' + roleClass(t ? t.roleId : '') + '">'
           + '<div><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></div>'
-          + '<div class="cal-time">' + (t ? t.start + '–' + t.end : '') + '</div>'
+          + '<div class="cal-time mono">' + (t ? t.start + '–' + t.end : '') + '</div>'
           + '<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">' + (openReq
               ? '<span class="pill status-open">בקשה פתוחה</span>'
               : ('<button class="btn secondary sm" data-action="request-swap" data-aid="' + a.id + '">בקש/י החלפה</button><button class="btn sm danger" data-action="report-noshow" data-aid="' + a.id + '">לא אוכל/ה להגיע</button>'))
@@ -834,7 +859,7 @@ function myConstraintsHtml() {
   return '<div class="card"><div class="card-head"><h2>האילוצים שלי</h2><button class="btn" data-action="add-constraint">+ הוספת אילוץ</button></div>'
     + '<div class="helpcard">אילוצים לשבוע ' + weekLabel(target) + ' ניתן להגיש עד יום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59. לאחר מכן יש לפנות להנהלה לעדכון ידני.</div>'
     + (list.length ? ('<table class="xltable"><thead><tr><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th><th></th></tr></thead><tbody>' + list.map(function (c) {
-        return '<tr><td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td><td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td><td>' + (c.allDay ? 'כל היום' : (c.start + '–' + c.end)) + '</td><td><button class="iconbtn" data-action="delete-constraint" data-id="' + c.id + '">מחיקה</button></td></tr>';
+        return '<tr><td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td><td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td><td>' + (c.allDay ? 'כל היום' : ('<span class="mono">' + c.start + '–' + c.end + '</span>')) + '</td><td><button class="iconbtn" data-action="delete-constraint" data-id="' + c.id + '">מחיקה</button></td></tr>';
       }).join('') + '</tbody></table>') : '<div class="empty">לא הוגשו אילוצים</div>')
     + '</div>';
 }
