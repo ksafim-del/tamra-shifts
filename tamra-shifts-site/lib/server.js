@@ -11,6 +11,7 @@ const xlsxTruth = require('./xlsx-truth.js');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const VALID_ROLES = ['fuel', 'store']; // office removed — no shifts are scheduled for it anymore
+const VALID_GENDERS = ['male', 'female'];
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -151,7 +152,8 @@ function makeApp(store, opts) {
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
     if (!body.name || !body.roleId || !body.pin) return sendJson(res, 400, { error: 'missing_fields' });
     if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
-    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null });
+    if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
+    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null, gender: body.gender || null });
     return sendJson(res, 200, { employee: emp });
   });
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
@@ -160,6 +162,7 @@ function makeApp(store, opts) {
     // Only block switching TO an invalid role; editing other fields on a legacy
     // (e.g. pre-existing office) employee should not be blocked by this.
     if (body.roleId && body.roleId !== 'office' && !VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
+    if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
     const emp = await store.updateEmployee(params.id, body);
     if (!emp) return sendJson(res, 404, { error: 'not_found' });
     return sendJson(res, 200, { employee: emp });
@@ -208,8 +211,21 @@ function makeApp(store, opts) {
   route('POST', '/api/schedule/:weekStart/assign', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const [templates, constraints, employee] = await Promise.all([
+      store.listShiftTemplates(), store.listConstraints(body.employeeId), store.getEmployee(body.employeeId),
+    ]);
+    const template = templates.find(t => t.id === body.shiftTemplateId);
+    const constraintConflict = !!template && S.isBlocked(body.employeeId, body.date, template.start, template.end, constraints);
     const id = await store.addAssignment(params.weekStart, body.date, body.shiftTemplateId, body.employeeId);
-    return sendJson(res, 200, { id });
+    if (constraintConflict) {
+      const desc = (template.label + ' ' + body.date + ' (' + template.start + '-' + template.end + ')');
+      await store.addNotification({
+        audience: 'manager', type: 'constraint-conflict', relatedId: id,
+        text: 'שובץ/ה ' + (employee ? employee.name : 'עובד/ת') + ' למשמרת ' + desc + ' בניגוד לאילוץ שהגיש/ה.',
+        severity: 'warning', channels: ['inapp'],
+      });
+    }
+    return sendJson(res, 200, { id, constraintConflict });
   });
   route('DELETE', '/api/assignment/:id', async (req, res, params) => {
     const session = await requireSession(req);
