@@ -166,7 +166,7 @@ function generateSchedule(weekStart, data) {
   for (let d = 0; d < 7; d++) {
     const ds = addDays(weekStart, d);
     const dow = dowOf(ds);
-    const templates = shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; });
+    const templates = shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1 && t.autoAssign !== false; });
     templates.forEach(function (t) {
       const need = t.needed;
       const restCheckPool = priorAssignments.concat(assignments.map(function (a) {
