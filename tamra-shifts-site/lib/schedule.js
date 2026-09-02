@@ -173,6 +173,7 @@ function generateSchedule(weekStart, data) {
         return Object.assign({}, a, { _startTs: tsFor(a.date, templatesById[a.shiftTemplateId].start) });
       }));
       let pool = employees.filter(function (e) { return e.active && e.roleId === t.roleId; });
+      if (t.requiredGender) pool = pool.filter(function (e) { return e.gender === t.requiredGender; });
       pool = pool.filter(function (e) { return !isBlocked(e.id, ds, t.start, t.end, constraints); });
       pool = pool.filter(function (e) { return !hasRestConflict(e.id, ds, t.start, meta.minRestHours, restCheckPool); });
       pool = pool.filter(function (e) {
