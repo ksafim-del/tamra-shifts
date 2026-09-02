@@ -39,7 +39,7 @@ test('manager login + bootstrap + employee CRUD via HTTP', async (t) => {
   const bootBody = await boot.json();
   assert.strictEqual(boot.status, 200);
   assert.strictEqual(bootBody.session.type, 'manager');
-  assert.strictEqual(bootBody.shiftTemplates.length, 6);
+  assert.strictEqual(bootBody.shiftTemplates.length, 10);
 
   const create = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ name: 'דני כהן', roleId: 'fuel', pin: '1111' }) });
   const createBody = await create.json();
@@ -218,4 +218,44 @@ test('POST /api/hours/truth: manager-only, parses the uploaded attendance .xlsx 
   // the other two file rows (ASAD JERIS, and the row named "עובד לא קיים באתר") have no matching site employee
   assert.strictEqual(body.unmatched.length, 2);
   assert.ok(body.unmatched.every((u) => u.fileName !== 'מרווה עאבד'));
+});
+
+test('POST /api/schedule/:weekStart/assign flags a conflict when the employee has a blocking constraint, but still assigns (manager override)', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+
+  const eRes = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד1', roleId: 'fuel', pin: '1111', gender: 'male' }) });
+  const emp = (await eRes.json()).employee;
+  assert.strictEqual(emp.gender, 'male');
+
+  const { shiftTemplates } = await (await fetch(base + '/api/templates', { headers: { Cookie: mgrCookie } })).json();
+  const morning = shiftTemplates.find(t => t.roleId === 'fuel' && t.label === 'בוקר מתדלקים');
+  assert.ok(morning);
+
+  const targetDate = S.addDays(S.todayStr(), 60); // far enough in the future to be unambiguous
+  const weekStart = S.weekKeyOf(targetDate);
+
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: emp.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+  const constraintRes = await fetch(base + '/api/constraints', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'date', date: targetDate, allDay: true }) });
+  assert.strictEqual(constraintRes.status, 200);
+
+  const assignRes = await fetch(base + '/api/schedule/' + weekStart + '/assign', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ date: targetDate, shiftTemplateId: morning.id, employeeId: emp.id }) });
+  assert.strictEqual(assignRes.status, 200);
+  const assignBody = await assignRes.json();
+  assert.strictEqual(assignBody.constraintConflict, true);
+
+  const week = await (await fetch(base + '/api/schedule/' + weekStart, { headers: { Cookie: mgrCookie } })).json();
+  assert.ok(week.week.assignments.some(a => a.id === assignBody.id), 'the assignment is still made despite the conflict (manager override)');
+
+  const notifs = await (await fetch(base + '/api/notifications', { headers: { Cookie: mgrCookie } })).json();
+  assert.ok(notifs.notifications.some(n => n.type === 'constraint-conflict' && n.severity === 'warning'), 'manager is warned about the conflict');
+
+  // sanity: assigning an employee with NO conflicting constraint reports no conflict
+  const e2Res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד2', roleId: 'fuel', pin: '2222' }) });
+  const emp2 = (await e2Res.json()).employee;
+  const cleanAssign = await fetch(base + '/api/schedule/' + weekStart + '/assign', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ date: targetDate, shiftTemplateId: morning.id, employeeId: emp2.id }) });
+  assert.strictEqual((await cleanAssign.json()).constraintConflict, false);
 });
