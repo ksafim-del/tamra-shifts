@@ -24,13 +24,24 @@ async function generateWeek(store, weekStart, { force } = {}) {
   await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt);
 
   if (result.understaffed.length) {
-    const lines = result.understaffed.map(u => {
+    // A short, organized summary rather than one line per missing slot — the full breakdown
+    // is always visible in the "לוז שבועי" tab itself, so the notification just needs to say
+    // how many and where to look, grouped by role for a bit of useful shape.
+    const roleLabels = { fuel: 'מתדלקים', store: 'עובדי חנות' };
+    const missingByRole = {};
+    let totalMissing = 0;
+    result.understaffed.forEach(u => {
       const t = templatesById[u.shiftTemplateId];
-      return u.date + ' ' + (t ? t.label + ' (' + t.start + '-' + t.end + ')' : u.shiftTemplateId) + ' — חסרים ' + u.missing;
+      const roleId = t ? t.roleId : 'אחר';
+      missingByRole[roleId] = (missingByRole[roleId] || 0) + u.missing;
+      totalMissing += u.missing;
     });
+    const breakdown = Object.keys(missingByRole)
+      .map(r => missingByRole[r] + ' ' + (roleLabels[r] || r))
+      .join(', ');
     await store.addNotification({
       audience: 'manager', type: 'understaffed',
-      text: 'הלוז לשבוע ' + weekStart + ' הופק אך יש משמרות לא מאוישות:\n' + lines.join('\n'),
+      text: 'הלוז לשבוע ' + weekStart + ' הופק — ' + totalMissing + ' משמרות ללא איוש (' + breakdown + '). לפירוט מלא: לשונית "לוז שבועי".',
       severity: 'warning', channels: ['inapp', 'email'],
     });
   } else {
