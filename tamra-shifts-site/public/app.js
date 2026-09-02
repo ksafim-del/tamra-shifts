@@ -27,12 +27,14 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){retu
 function roleClass(id){ return id==='fuel'?'role-fuel':(id==='store'?'role-store':'role-other'); }
 function roleLabel(id){ return id==='fuel'?'מתדלק/ת':(id==='store'?'עובד/ת חנות':'פקיד/ה (הוסר)'); }
 function roleLabelPlural(id){ return id==='fuel'?'מתדלקים':(id==='store'?'עובדי חנות':'אחר'); }
+function genderLabel(g){ return g==='male'?'זכר':(g==='female'?'נקבה':'לא צוין'); }
+function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-female':'gender-unset'); }
 
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'' };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all' };
 
 /* ---------- api ---------- */
 function api(method, path, body) {
@@ -162,6 +164,7 @@ function handleAction(action, el, ev) {
   if (action === 'week-next') { ui.currentWeek = addWeeks(ui.currentWeek, 1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-gen-target') { ui.currentWeek = nextGenerationWeek(); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'set-schedule-role') { ui.scheduleRole = el.getAttribute('data-role'); render(); return; }
+  if (action === 'set-employees-gender') { ui.employeesGender = el.getAttribute('data-gender'); render(); return; }
   if (action === 'month-prev') { ui.currentMonth = addMonths(ui.currentMonth, -1); render(); loadHours(ui.currentMonth); return; }
   if (action === 'month-next') { ui.currentMonth = addMonths(ui.currentMonth, 1); render(); loadHours(ui.currentMonth); return; }
 
@@ -193,7 +196,11 @@ function handleAction(action, el, ev) {
     var date = el.getAttribute('data-date'), tid = el.getAttribute('data-tid'), empId = el.value;
     if (!empId) return;
     api('POST', '/api/schedule/' + ui.currentWeek + '/assign', { date: date, shiftTemplateId: tid, employeeId: empId }).then(function (r) {
-      if (r.ok) { toast('שובץ', 'ok'); loadWeek(ui.currentWeek); } else toast('שגיאה בשיבוץ', 'err');
+      if (r.ok) {
+        if (r.data.constraintConflict) toast('שובץ/ה — אבל בניגוד לאילוץ שהעובד/ת הגיש/ה! נשלחה התראה', 'err');
+        else toast('שובץ', 'ok');
+        loadWeek(ui.currentWeek);
+      } else toast('שגיאה בשיבוץ', 'err');
     });
     return;
   }
@@ -277,7 +284,7 @@ function handleSubmit(action, form) {
     return;
   }
   if (action === 'submit-employee') {
-    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin') };
+    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin'), gender: f.get('gender') || null };
     var editing = ui.modal && ui.modal.employee;
     var call = editing ? api('PATCH', '/api/employees/' + ui.modal.employee.id, payload) : api('POST', '/api/employees', payload);
     call.then(function (r) {
@@ -371,6 +378,21 @@ function ensureTabData() {
   if ((tab === 'mynotifs' || tab === 'overview' || tab === 'requests') && !CACHE.notifications) loadNotifications();
   if (tab === 'myswaps' && !CACHE.swaps) loadSwaps();
 }
+
+// Other people (an employee claiming a swap, reporting a no-show, submitting a constraint)
+// change shared data server-side without this tab knowing — there's no push/websocket here,
+// so poll quietly in the background while a relevant tab is open. Full-list refreshes only
+// (never while a modal/form is open) so nothing interrupts something the user is mid-typing.
+var LIVE_POLL_MS = 25000;
+setInterval(function () {
+  if (!STATE || !ui.tab || ui.modal) return;
+  var tab = ui.tab;
+  if (tab === 'schedule' || tab === 'myschedule') loadWeek(ui.currentWeek);
+  if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); loadNotifications(); }
+  if (tab === 'requests') { loadSwaps(); loadConstraints(); loadNotifications(); }
+  if (tab === 'myswaps') loadSwaps();
+  if (tab === 'mynotifs') loadNotifications();
+}, LIVE_POLL_MS);
 
 /* ============================================================ RENDER ============================================================ */
 function render() {
@@ -611,15 +633,23 @@ function scheduleHtml() {
 
 /* ---------- employees (manager) ---------- */
 function employeesHtml() {
-  var list = CACHE.employeesFull || STATE.employees;
+  var all = CACHE.employeesFull || STATE.employees;
+  var genderFilter = ui.employeesGender || 'all';
+  var list = genderFilter === 'all' ? all : all.filter(function (e) { return e.gender === genderFilter; });
   return '<div class="card"><div class="card-head"><h2>עובדים</h2><button class="btn" data-action="add-employee">+ הוספת עובד/ת</button></div>'
-    + '<table><thead><tr><th>שם</th><th>תפקיד</th><th>PIN</th><th>סטטוס</th><th></th></tr></thead><tbody>'
+    + '<div class="seg" style="margin-bottom:12px;">'
+      + '<button type="button" data-action="set-employees-gender" data-gender="all" class="' + (genderFilter==='all'?'active':'') + '">הכול (' + all.length + ')</button>'
+      + '<button type="button" data-action="set-employees-gender" data-gender="male" class="' + (genderFilter==='male'?'active':'') + '">זכר (' + all.filter(function(e){return e.gender==='male';}).length + ')</button>'
+      + '<button type="button" data-action="set-employees-gender" data-gender="female" class="' + (genderFilter==='female'?'active':'') + '">נקבה (' + all.filter(function(e){return e.gender==='female';}).length + ')</button>'
+    + '</div>'
+    + '<table><thead><tr><th>שם</th><th>תפקיד</th><th>מגדר</th><th>PIN</th><th>סטטוס</th><th></th></tr></thead><tbody>'
     + list.map(function (e) {
       return '<tr><td>' + esc(e.name) + '</td><td><span class="pill ' + roleClass(e.roleId) + '">' + esc(roleLabel(e.roleId)) + '</span></td>'
+        + '<td><span class="pill ' + genderClass(e.gender) + '">' + esc(genderLabel(e.gender)) + '</span></td>'
         + '<td class="mono">' + esc(e.pin || '••••') + '</td><td>' + (e.active ? 'פעיל/ה' : 'לא פעיל/ה') + '</td>'
         + '<td><button class="iconbtn" data-action="edit-employee" data-id="' + e.id + '">עריכה</button> <button class="iconbtn" data-action="deactivate-employee" data-id="' + e.id + '">' + (e.active ? 'השבתה' : 'הפעלה') + '</button></td></tr>';
     }).join('') + '</tbody></table>'
-    + (list.length ? '' : '<div class="empty">אין עדיין עובדים — הוסיפו את הראשון/ה</div>')
+    + (list.length ? '' : '<div class="empty">' + (all.length ? 'אין עובדים בסינון הזה' : 'אין עדיין עובדים — הוסיפו את הראשון/ה') + '</div>')
     + '</div>';
 }
 
@@ -862,6 +892,7 @@ function modalHtml() {
       + '<div class="field"><label>תפקיד</label><select name="roleId"><option value="fuel"' + (e && e.roleId==='fuel'?' selected':'') + '>מתדלק/ת</option><option value="store"' + (e && e.roleId==='store'?' selected':'') + '>עובד/ת חנות</option>'
         + (e && e.roleId === 'office' ? '<option value="office" selected>פקיד/ה (תפקיד שהוסר — אפשר לבחור תפקיד אחר)</option>' : '') + '</select></div>'
       + '<div class="field"><label>קוד PIN אישי</label><input name="pin" pattern="[0-9]{4,6}" required value="' + (e ? esc(e.pin||'') : '') + '"></div>'
+      + '<div class="field"><label>מגדר</label><select name="gender" required><option value="">בחר/י</option><option value="male"' + (e && e.gender==='male'?' selected':'') + '>זכר</option><option value="female"' + (e && e.gender==='female'?' selected':'') + '>נקבה</option></select></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
   } else if (m.type === 'constraint-form') {
