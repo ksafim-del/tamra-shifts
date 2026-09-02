@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS employees (
   pin TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   max_shifts_per_week INTEGER,
+  gender TEXT,
   created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shift_templates (
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS shift_templates (
   end_time TEXT NOT NULL,
   needed INTEGER NOT NULL,
   days TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1
+  active INTEGER NOT NULL DEFAULT 1,
+  auto_assign INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS schedules (
   week_start TEXT PRIMARY KEY,
@@ -101,12 +103,19 @@ const DEFAULT_SETTINGS = {
 };
 
 const DEFAULT_TEMPLATES = [
-  { roleId: 'fuel', label: 'בוקר מתדלקים', start: '05:00', end: '13:00', needed: 3, days: [0,1,2,3,4,5,6] },
-  { roleId: 'fuel', label: 'צהריים מתדלקים', start: '13:00', end: '21:00', needed: 2, days: [0,1,2,3,4,5,6] },
-  { roleId: 'fuel', label: 'לילה מתדלקים', start: '21:00', end: '05:00', needed: 1, days: [0,1,2,3,4,5,6] },
-  { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6] },
+  // Sunday-Friday for fuel — Saturday is covered by the three dedicated שבת templates below instead.
+  { roleId: 'fuel', label: 'בוקר מתדלקים', start: '05:00', end: '13:00', needed: 3, days: [0,1,2,3,4,5] },
+  { roleId: 'fuel', label: 'צהריים מתדלקים', start: '13:00', end: '21:00', needed: 2, days: [0,1,2,3,4,5] },
+  { roleId: 'fuel', label: 'לילה מתדלקים', start: '21:00', end: '05:00', needed: 1, days: [0,1,2,3,4,5,6] }, // night stays the same every day, including Saturday
+  { roleId: 'fuel', label: 'בוקר מתדלקים (שבת)', start: '05:00', end: '13:00', needed: 1, days: [6] },
+  { roleId: 'fuel', label: 'ביניים מתדלקים (שבת)', start: '09:00', end: '21:00', needed: 1, days: [6] },
+  { roleId: 'fuel', label: 'צהריים מתדלקים (שבת)', start: '13:00', end: '23:00', needed: 1, days: [6] },
+  // store morning is manual-only: the slot exists so a manager can staff it by hand, but the
+  // automatic weekly generator never fills it on its own (autoAssign: false).
+  { roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6], autoAssign: false },
   { roleId: 'store', label: 'צהריים חנות', start: '13:00', end: '21:00', needed: 1, days: [0,1,2,3,4,5,6] },
   { roleId: 'store', label: 'לילה חנות', start: '21:00', end: '07:00', needed: 1, days: [0,1,2,3,4,5,6] },
+  { roleId: 'store', label: 'ביניים חנות', start: '10:00', end: '17:00', needed: 1, days: [2,6] }, // Tuesday + Saturday
   // office shifts intentionally not scheduled — see deactivateOfficeTemplates below.
 ];
 
@@ -125,9 +134,49 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE notifications ALTER COLUMN created_at TYPE BIGINT',
     'ALTER TABLE swap_requests ADD COLUMN IF NOT EXISTS date TEXT',
     'ALTER TABLE swap_requests ADD COLUMN IF NOT EXISTS shift_template_id TEXT',
+    'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS auto_assign INTEGER NOT NULL DEFAULT 1',
+    'ALTER TABLE employees ADD COLUMN IF NOT EXISTS gender TEXT',
   ];
   for (const s of alters) {
     try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
+  }
+}
+
+// Updates the fuel/store shift templates to the current spec on every startup, on any
+// database seeded before this change (including production). Idempotent: each step only
+// acts when the live data doesn't already match, so re-running it is always a no-op once
+// applied — same "self-healing on startup" approach as deactivateOfficeTemplates below.
+async function applyScheduleTemplateSpecV2(db) {
+  const rows = await db.all('SELECT * FROM shift_templates', []);
+
+  async function dropDay(roleId, label, dayToRemove) {
+    const row = rows.find(r => r.role_id === roleId && r.label === label);
+    if (!row) return;
+    const days = JSON.parse(row.days);
+    if (days.indexOf(dayToRemove) === -1) return;
+    await db.run('UPDATE shift_templates SET days = ? WHERE id = ?', [JSON.stringify(days.filter(d => d !== dayToRemove)), row.id]);
+  }
+  // Saturday for fuel is now covered by the three dedicated שבת templates below instead of
+  // the regular Sunday-Friday morning/afternoon templates.
+  await dropDay('fuel', 'בוקר מתדלקים', 6);
+  await dropDay('fuel', 'צהריים מתדלקים', 6);
+
+  async function ensureTemplate(t) {
+    if (rows.find(r => r.role_id === t.roleId && r.label === t.label)) return;
+    await db.run(
+      'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
+      [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]
+    );
+  }
+  await ensureTemplate({ roleId: 'fuel', label: 'בוקר מתדלקים (שבת)', start: '05:00', end: '13:00', needed: 1, days: [6] });
+  await ensureTemplate({ roleId: 'fuel', label: 'ביניים מתדלקים (שבת)', start: '09:00', end: '21:00', needed: 1, days: [6] });
+  await ensureTemplate({ roleId: 'fuel', label: 'צהריים מתדלקים (שבת)', start: '13:00', end: '23:00', needed: 1, days: [6] });
+  await ensureTemplate({ roleId: 'store', label: 'ביניים חנות', start: '10:00', end: '17:00', needed: 1, days: [2, 6] });
+
+  // store morning is manual-only from now on — it should never be auto-filled by generation.
+  const storeMorning = rows.find(r => r.role_id === 'store' && r.label === 'בוקר חנות');
+  if (storeMorning && Number(storeMorning.auto_assign) !== 0) {
+    await db.run('UPDATE shift_templates SET auto_assign = 0 WHERE id = ?', [storeMorning.id]);
   }
 }
 
@@ -150,33 +199,37 @@ async function initSchema(db) {
   if (!tCount || Number(tCount.c) === 0) {
     for (const t of DEFAULT_TEMPLATES) {
       await db.run(
-        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active) VALUES (?,?,?,?,?,?,?,1)',
-        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days)]
+        'INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
+        [uid(), t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]
       );
     }
   }
   await deactivateOfficeTemplates(db);
+  await applyScheduleTemplateSpecV2(db);
 }
 
 function rowToEmployee(r, includePin) {
-  const e = { id: r.id, name: r.name, roleId: r.role_id, active: !!r.active, maxShiftsPerWeek: r.max_shifts_per_week || null };
+  const e = { id: r.id, name: r.name, roleId: r.role_id, active: !!r.active, maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null };
   if (includePin) e.pin = r.pin;
   return e;
 }
 function rowToTemplate(r) {
-  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active };
+  return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign };
 }
 function rowToConstraint(r) {
-  return { id: r.id, employeeId: r.employee_id, kind: r.kind, date: r.date || null, dayOfWeek: r.day_of_week == null ? null : r.day_of_week, allDay: !!r.all_day, start: r.start_time || null, end: r.end_time || null, createdAt: r.created_at };
+  // created_at is a BIGINT column — Postgres' driver returns those as strings (to avoid
+  // precision loss), which makes new Date(str) on the frontend produce "Invalid Date".
+  // Number(...) here keeps every dialect returning a plain JS number.
+  return { id: r.id, employeeId: r.employee_id, kind: r.kind, date: r.date || null, dayOfWeek: r.day_of_week == null ? null : r.day_of_week, allDay: !!r.all_day, start: r.start_time || null, end: r.end_time || null, createdAt: Number(r.created_at) };
 }
 function rowToAssignment(r) {
   return { id: r.id, weekStart: r.week_start, date: r.date, shiftTemplateId: r.shift_template_id, employeeId: r.employee_id, noShow: !!r.no_show };
 }
 function rowToSwap(r) {
-  return { id: r.id, assignmentId: r.assignment_id, requesterId: r.requester_id, roleId: r.role_id, kind: r.kind, status: r.status, claimedBy: r.claimed_by || null, createdAt: r.created_at, resolvedAt: r.resolved_at || null, date: r.date || null, shiftTemplateId: r.shift_template_id || null };
+  return { id: r.id, assignmentId: r.assignment_id, requesterId: r.requester_id, roleId: r.role_id, kind: r.kind, status: r.status, claimedBy: r.claimed_by || null, createdAt: Number(r.created_at), resolvedAt: r.resolved_at == null ? null : Number(r.resolved_at), date: r.date || null, shiftTemplateId: r.shift_template_id || null };
 }
 function rowToNotification(r) {
-  return { id: r.id, audience: r.audience, employeeId: r.employee_id || null, type: r.type, text: r.text, severity: r.severity, relatedId: r.related_id || null, channels: JSON.parse(r.channels), read: !!r.read, ts: r.created_at };
+  return { id: r.id, audience: r.audience, employeeId: r.employee_id || null, type: r.type, text: r.text, severity: r.severity, relatedId: r.related_id || null, channels: JSON.parse(r.channels), read: !!r.read, ts: Number(r.created_at) };
 }
 
 function makeStore(db) {
@@ -207,11 +260,11 @@ function makeStore(db) {
       const row = await db.get('SELECT * FROM employees WHERE id = ? AND pin = ? AND active = 1', [id, pin]);
       return row ? rowToEmployee(row, true) : null;
     },
-    async createEmployee({ name, roleId, pin, maxShiftsPerWeek }) {
+    async createEmployee({ name, roleId, pin, maxShiftsPerWeek, gender }) {
       const id = uid();
       await db.run(
-        'INSERT INTO employees (id, name, role_id, pin, active, max_shifts_per_week, created_at) VALUES (?,?,?,?,1,?,?)',
-        [id, name, roleId, pin, maxShiftsPerWeek || null, Date.now()]
+        'INSERT INTO employees (id, name, role_id, pin, active, max_shifts_per_week, gender, created_at) VALUES (?,?,?,?,1,?,?,?)',
+        [id, name, roleId, pin, maxShiftsPerWeek || null, gender || null, Date.now()]
       );
       return this.getEmployee(id);
     },
@@ -224,9 +277,10 @@ function makeStore(db) {
         pin: patch.pin != null ? patch.pin : cur.pin,
         active: patch.active != null ? (patch.active ? 1 : 0) : cur.active,
         max_shifts_per_week: patch.maxShiftsPerWeek !== undefined ? patch.maxShiftsPerWeek : cur.max_shifts_per_week,
+        gender: patch.gender != null ? patch.gender : cur.gender,
       };
-      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=? WHERE id=?',
-        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, id]);
+      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=?, gender=? WHERE id=?',
+        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, next.gender, id]);
       return this.getEmployee(id);
     },
 
@@ -236,8 +290,8 @@ function makeStore(db) {
     },
     async createShiftTemplate(t) {
       const id = uid();
-      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active) VALUES (?,?,?,?,?,?,?,1)',
-        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days)]);
+      await db.run('INSERT INTO shift_templates (id, role_id, label, start_time, end_time, needed, days, active, auto_assign) VALUES (?,?,?,?,?,?,?,1,?)',
+        [id, t.roleId, t.label, t.start, t.end, t.needed, JSON.stringify(t.days), t.autoAssign === false ? 0 : 1]);
       return id;
     },
     async updateShiftTemplate(id, patch) {
@@ -251,16 +305,23 @@ function makeStore(db) {
         needed: patch.needed != null ? patch.needed : cur.needed,
         days: patch.days != null ? JSON.stringify(patch.days) : cur.days,
         active: patch.active != null ? (patch.active ? 1 : 0) : cur.active,
+        auto_assign: patch.autoAssign != null ? (patch.autoAssign ? 1 : 0) : cur.auto_assign,
       };
-      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=? WHERE id=?',
-        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, id]);
+      await db.run('UPDATE shift_templates SET role_id=?, label=?, start_time=?, end_time=?, needed=?, days=?, active=?, auto_assign=? WHERE id=?',
+        [next.role_id, next.label, next.start_time, next.end_time, next.needed, next.days, next.active, next.auto_assign, id]);
       return true;
     },
 
     async getScheduleWeek(weekStart) {
       const row = await db.get('SELECT * FROM schedules WHERE week_start = ?', [weekStart]);
-      if (!row) return null;
       const assignments = await db.all('SELECT * FROM assignments WHERE week_start = ?', [weekStart]);
+      // A week can have manual assignments (added via the "+ שיבוץ ידני" dropdown) before it has
+      // ever been auto-generated — there's no `schedules` row yet in that case. Only treat the
+      // week as truly empty (return null) when there's neither a generated schedule nor any
+      // manual assignment; otherwise those assignments would be invisible until generation, and
+      // then silently wiped out the moment someone did generate (generateWeek only skips an
+      // already-generated week, and without this a manually-assigned week never counted as one).
+      if (!row && !assignments.length) return null;
       const templateRows = await db.all('SELECT id, active FROM shift_templates', []);
       const activeById = {};
       templateRows.forEach(t => { activeById[t.id] = !!t.active; });
@@ -270,9 +331,10 @@ function makeStore(db) {
       // otherwise keep showing "missing" forever for a week generated before the removal.
       // A shiftTemplateId we have no record of at all is left in place rather than hidden —
       // safer to show a possibly-orphaned entry than to silently swallow a real one.
-      const understaffed = JSON.parse(row.understaffed).filter(u =>
-        !Object.prototype.hasOwnProperty.call(activeById, u.shiftTemplateId) || activeById[u.shiftTemplateId]);
-      return { weekStart, understaffed, generatedAt: row.generated_at, assignments: assignments.map(rowToAssignment) };
+      const understaffed = row
+        ? JSON.parse(row.understaffed).filter(u => !Object.prototype.hasOwnProperty.call(activeById, u.shiftTemplateId) || activeById[u.shiftTemplateId])
+        : [];
+      return { weekStart, understaffed, generatedAt: row ? Number(row.generated_at) : null, assignments: assignments.map(rowToAssignment) };
     },
     async listAllWeekKeys() {
       const rows = await db.all('SELECT week_start FROM schedules ORDER BY week_start ASC', []);
