@@ -475,50 +475,55 @@ function overviewHtml() {
       + '</div>';
   }
   html += '<div class="kpis">'
-    + '<div class="kpi"><div class="num">' + (STATE.employees.filter(function(e){return e.active;}).length) + '</div><div class="lbl">עובדים פעילים</div></div>'
-    + '<div class="kpi"><div class="num">' + (understaffed == null ? '—' : understaffed) + '</div><div class="lbl">משמרות חסרות איוש (שבוע נוכחי)</div></div>'
-    + '<div class="kpi"><div class="num">' + unread + '</div><div class="lbl">התראות שלא נקראו</div></div>'
+    + '<div class="kpi kpi-neutral"><span class="kpi-ic">👥</span><div class="num">' + (STATE.employees.filter(function(e){return e.active;}).length) + '</div><div class="lbl">עובדים פעילים</div></div>'
+    + '<div class="kpi ' + (understaffed ? 'kpi-warn' : 'kpi-ok') + '"><span class="kpi-ic">' + (understaffed ? '⚠️' : '✅') + '</span><div class="num">' + (understaffed == null ? '—' : understaffed) + '</div><div class="lbl">משמרות חסרות איוש (שבוע נוכחי)</div></div>'
+    + '<div class="kpi ' + (unread ? 'kpi-accent' : 'kpi-neutral') + '"><span class="kpi-ic">🔔</span><div class="num">' + unread + '</div><div class="lbl">התראות שלא נקראו</div></div>'
     + '</div>';
 
-  html += '<div class="card"><div class="card-head"><h2>תקלות והודעות לפי יום — ' + weekLabel(wk) + '</h2></div>';
+  html += '<div class="card"><div class="card-head"><h2>סדר יום — ' + weekLabel(wk) + '</h2></div>';
   if (!week) {
     html += '<div class="empty">טוען…</div>';
   } else {
     var swaps = CACHE.swaps || [];
-    var rows = '';
+    var dayHtml = '';
     for (var d = 0; d < 7; d++) {
       var ds = addDays(wk, d);
-      var items = [];
+      var chips = [];
       week.understaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
-        items.push('<span class="understaffed">חסר ' + u.missing + '</span> ' + esc(t ? t.label : ''));
+        chips.push('<span class="chip chip-err">חסר ' + u.missing + ' — ' + esc(t ? t.label : '') + '</span>');
       });
       week.assignments.filter(function (a) { return a.date === ds && a.noShow; }).forEach(function (a) {
         var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
-        items.push('<span class="understaffed">לא הגיע/ה</span> ' + esc(emp ? emp.name : '?') + (t ? ' (' + esc(t.label) + ')' : ''));
+        chips.push('<span class="chip chip-err">לא הגיע/ה — ' + esc(emp ? emp.name : '?') + (t ? ' (' + esc(t.label) + ')' : '') + '</span>');
       });
       week.assignments.filter(function (a) { return a.date === ds; }).forEach(function (a) {
         var openSwap = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
         if (openSwap) {
           var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
-          items.push('<span class="pill status-open">בקשת החלפה פתוחה</span> ' + esc(t ? t.label : ''));
+          chips.push('<span class="chip chip-open">בקשת החלפה פתוחה — ' + esc(t ? t.label : '') + '</span>');
         }
       });
       var dayNotifs = notifs.filter(function (n) {
         var nd = new Date(n.ts);
         return dateStrOf(nd.getFullYear(), nd.getMonth() + 1, nd.getDate()) === ds;
       });
-      var notifItems = dayNotifs.map(function (n) {
+      var notifRows = dayNotifs.map(function (n) {
         var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
-        return '<span class="mono">' + time + '</span> ' + (n.read ? '' : '<b>') + esc(n.text) + (n.read ? '' : '</b>');
-      });
-      rows += '<tr><td style="width:120px;white-space:nowrap;">' + dayDateHtml(ds) + '</td>'
-        + '<td>' + (items.length ? items.join('<br>') : '<span style="color:var(--ok)">אין תקלות</span>') + '</td>'
-        + '<td>' + (notifItems.length ? notifItems.join('<br>') : '—') + '</td>'
-        + '</tr>';
+        return '<div class="agenda-notif' + (n.read ? '' : ' unread') + '"><span class="mono">' + time + '</span> ' + esc(n.text) + '</div>';
+      }).join('');
+      var hasIssue = chips.length > 0;
+      dayHtml += '<div class="agenda-day' + (ds === todayStr() ? ' today' : '') + (hasIssue ? ' has-issue' : '') + '">'
+        + '<div class="agenda-day-head">'
+        + '<div class="agenda-day-title">' + dayDateHtml(ds) + '</div>'
+        + '<span class="pill ' + (hasIssue ? 'pill-issue' : 'pill-clear') + '">' + (hasIssue ? (chips.length + ' תקלות') : 'הכול תקין') + '</span>'
+        + '</div>'
+        + (chips.length ? ('<div class="agenda-chips">' + chips.join('') + '</div>') : '')
+        + (notifRows ? ('<div class="agenda-notifs">' + notifRows + '</div>') : '')
+        + '</div>';
     }
-    html += '<table class="xltable"><thead><tr><th style="width:120px">יום</th><th>תקלות</th><th>הודעות</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    html += '<div class="agenda">' + dayHtml + '</div>';
   }
   html += '</div>';
   return html;
@@ -596,7 +601,7 @@ function scheduleHtml() {
     return t && t.roleId === roleFilter;
   });
   if (roleUnderstaffed.length) {
-    html += '<div class="banner err">יש ' + roleUnderstaffed.length + ' משמרות ' + esc(roleLabelPlural(roleFilter)) + ' ללא איוש מלא השבוע — ראה/י פירוט בכרטיסי הימים למטה וניתן לשבץ ידנית.</div>';
+    html += '<div class="banner err">⚠️ יש ' + roleUnderstaffed.length + ' משמרות ' + esc(roleLabelPlural(roleFilter)) + ' ללא איוש מלא השבוע — ראה/י פירוט בכרטיסי הימים למטה וניתן לשבץ ידנית.</div>';
   }
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
@@ -626,7 +631,7 @@ function scheduleHtml() {
           + '</div>';
       }).join('');
     }
-    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dow) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div>' + body + '</div>';
+    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dow) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div><div class="calday-body">' + body + '</div></div>';
   }).join('') + '</div></div>';
   return html;
 }
@@ -815,7 +820,7 @@ function myScheduleHtml() {
           + '</div></div>';
       }).join('');
     }
-    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dowOfDateStr(ds)) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div>' + body + '</div>';
+    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dowOfDateStr(ds)) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div><div class="calday-body">' + body + '</div></div>';
   }).join('') + '</div></div>';
   return html;
 }
