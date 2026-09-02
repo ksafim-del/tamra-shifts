@@ -201,6 +201,39 @@ async function deactivateOfficeTemplates(db) {
   await db.run("UPDATE shift_templates SET active = 0 WHERE role_id = 'office' AND active = 1", []);
 }
 
+// "understaffed" notifications used to be written as one long multi-line dump (a line per
+// missing slot). That format was later replaced with a short single-line summary, but existing
+// notifications already in the database keep whatever text they were created with — a
+// notification's text is a historical record, never rewritten by normal app code — so any
+// dumped before the change still shows the old wall of text in the overview's day agenda
+// forever. This one-time cleanup rewrites those specific rows to match the current short
+// format. Matched by the old format's fixed marker phrase, so it naturally becomes a no-op
+// (nothing left to match) once every old-format row has been rewritten — safe to run every
+// startup, same "self-healing" approach as the migrations above.
+async function cleanupVerboseUnderstaffedNotifications(db) {
+  const marker = ' הופק אך יש משמרות לא מאוישות:\n';
+  const roleLabels = { fuel: 'מתדלקים', store: 'עובדי חנות' };
+  const rows = await db.all("SELECT id, text FROM notifications WHERE type = 'understaffed'", []);
+  for (const row of rows) {
+    const idx = row.text.indexOf(marker);
+    if (idx === -1) continue; // already short-form (or some other shape) — leave it alone
+    const head = row.text.slice(0, idx);
+    const lines = row.text.slice(idx + marker.length).split('\n').filter(Boolean);
+    let total = 0;
+    const byRole = {};
+    lines.forEach(line => {
+      const m = line.match(/חסרים (\d+)\s*$/);
+      const missing = m ? Number(m[1]) : 0;
+      total += missing;
+      const roleId = line.indexOf('חנות') !== -1 ? 'store' : 'fuel';
+      byRole[roleId] = (byRole[roleId] || 0) + missing;
+    });
+    const breakdown = Object.keys(byRole).map(r => byRole[r] + ' ' + (roleLabels[r] || r)).join(', ');
+    const newText = head + ' הופק — ' + total + ' משמרות ללא איוש (' + breakdown + '). לפירוט מלא: לשונית "לוז שבועי".';
+    await db.run('UPDATE notifications SET text = ? WHERE id = ?', [newText, row.id]);
+  }
+}
+
 async function initSchema(db) {
   const statements = SCHEMA.split(';').map(s => s.trim()).filter(Boolean);
   for (const s of statements) await db.exec(s + ';');
@@ -221,6 +254,7 @@ async function initSchema(db) {
   await deactivateOfficeTemplates(db);
   await applyScheduleTemplateSpecV2(db);
   await applyScheduleTemplateSpecV3(db);
+  await cleanupVerboseUnderstaffedNotifications(db);
 }
 
 function rowToEmployee(r, includePin) {
