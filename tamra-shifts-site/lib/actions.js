@@ -23,6 +23,10 @@ async function generateWeek(store, weekStart, { force } = {}) {
   const result = S.generateSchedule(weekStart, { employees, shiftTemplates, constraints, meta, priorAssignments });
   await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt);
 
+  // A regeneration of the same week (manual "הפק מחדש", or the automatic Thursday run) replaces
+  // this week's status notification instead of piling another one on top of the last.
+  await store.replaceScheduleStatusNotification(weekStart);
+
   if (result.understaffed.length) {
     // A short, organized summary rather than one line per missing slot — the full breakdown
     // is always visible in the "לוז שבועי" tab itself, so the notification just needs to say
@@ -40,13 +44,13 @@ async function generateWeek(store, weekStart, { force } = {}) {
       .map(r => missingByRole[r] + ' ' + (roleLabels[r] || r))
       .join(', ');
     await store.addNotification({
-      audience: 'manager', type: 'understaffed',
+      audience: 'manager', type: 'understaffed', relatedId: weekStart,
       text: 'הלוז לשבוע ' + weekStart + ' הופק — ' + totalMissing + ' משמרות ללא איוש (' + breakdown + '). לפירוט מלא: לשונית "לוז שבועי".',
       severity: 'warning', channels: ['inapp', 'email'],
     });
   } else {
     await store.addNotification({
-      audience: 'manager', type: 'generated',
+      audience: 'manager', type: 'generated', relatedId: weekStart,
       text: 'הלוז לשבוע ' + weekStart + ' הופק בהצלחה, כל המשמרות מאוישות.',
       severity: 'info', channels: ['inapp'],
     });
