@@ -504,8 +504,10 @@ function overviewHtml() {
     var dayHtml = '';
     for (var d = 0; d < 7; d++) {
       var ds = addDays(wk, d);
-      // { start: minutes-since-midnight, html } so every issue on the day — understaffed,
-      // no-shows, open swaps — lines up in one earliest-to-latest order, like the schedule tab.
+      // Only real staffing problems and open requests belong here — understaffed slots,
+      // no-shows, and open swap requests. Raw notification text (swap history, schedule-
+      // generation status) already has its own home in "יומן התראות" (בקשות tab), so it
+      // doesn't duplicate here.
       var issues = [];
       liveUnderstaffed.filter(function (u) { return u.date === ds; }).forEach(function (u) {
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
@@ -525,14 +527,6 @@ function overviewHtml() {
       });
       issues.sort(function (a, b) { return a.start - b.start; });
       var chips = issues.map(function (i) { return i.html; });
-      var dayNotifs = notifs.filter(function (n) {
-        var nd = new Date(n.ts);
-        return dateStrOf(nd.getFullYear(), nd.getMonth() + 1, nd.getDate()) === ds;
-      }).slice().sort(function (a, b) { return a.ts - b.ts; }); // chronological within the day
-      var notifRows = dayNotifs.map(function (n) {
-        var time = new Date(n.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
-        return '<div class="agenda-notif' + (n.read ? '' : ' unread') + '"><span class="mono">' + time + '</span> ' + esc(n.text) + '</div>';
-      }).join('');
       var hasIssue = chips.length > 0;
       dayHtml += '<div class="agenda-day' + (ds === todayStr() ? ' today' : '') + (hasIssue ? ' has-issue' : '') + '">'
         + '<div class="agenda-day-head">'
@@ -540,7 +534,6 @@ function overviewHtml() {
         + '<span class="pill ' + (hasIssue ? 'pill-issue' : 'pill-clear') + '">' + (hasIssue ? (chips.length + ' תקלות') : 'הכול תקין') + '</span>'
         + '</div>'
         + (chips.length ? ('<div class="agenda-chips">' + chips.join('') + '</div>') : '')
-        + (notifRows ? ('<div class="agenda-notifs">' + notifRows + '</div>') : '')
         + '</div>';
     }
     html += '<div class="agenda">' + dayHtml + '</div>';
@@ -639,7 +632,8 @@ function scheduleHtml() {
       body = templates.map(function (t) {
         var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
         var missing = t.needed - assigned.length;
-        var manualOnly = t.autoAssign === false; // e.g. store morning: never auto-filled, never "missing" — just an optional manual add
+        var manualOnly = t.autoAssign === false; // never auto-filled, never "missing" — just an optional manual add
+        var canAddMore = missing > 0 || t.allowExtra; // e.g. store morning: fully staffed still keeps a manual "add one more" option
         return '<div class="calevent ' + roleClass(t.roleId) + '">'
           + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
           + '<div class="cal-time mono">' + t.start + '–' + t.end + '</div>'
@@ -649,7 +643,7 @@ function scheduleHtml() {
             }).join('')
           + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
           + '</div>'
-          + (missing > 0 ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
+          + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
           + '</div>';
       }).join('');
     }
