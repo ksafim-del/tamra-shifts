@@ -84,6 +84,9 @@ table.xltable td, table.xltable th { vertical-align: top; }
 .pill.role-fuel { background: #fde3c8; color: #7a3d0e; }
 .pill.role-store { background: #d7e6f0; color: #1F3B4D; }
 .pill.role-other { background: var(--surface-2); color: var(--text-dim); }
+.pill.gender-male { background: #d7e6f0; color: #1F3B4D; }
+.pill.gender-female { background: #f3d9e6; color: #7a1f4d; }
+.pill.gender-unset { background: var(--surface-2); color: var(--text-dim); }
 .banner { border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; font-size: 14px; }
 .banner.warn { background: #fdeccb; color: #7a4a0c; }
 .banner.err { background: #fbdcd6; color: #7a2214; }
