@@ -7,6 +7,8 @@ const S = require('./schedule.js');
 const auth = require('./auth.js');
 const actions = require('./actions.js');
 const xlsxTruth = require('./xlsx-truth.js');
+const xlsxWriter = require('./xlsx-writer.js');
+const scheduleExport = require('./schedule-export.js');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -207,6 +209,25 @@ function makeApp(store, opts) {
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
     const result = await actions.generateWeek(store, params.weekStart, { force: !!(body && body.force) });
     return sendJson(res, 200, result);
+  });
+  route('GET', '/api/schedule/:weekStart/export.xlsx', async (req, res, params) => {
+    const session = await requireSession(req);
+    if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const [week, templates, employees, settings] = await Promise.all([
+      store.getScheduleWeek(params.weekStart), store.listShiftTemplates(), store.listEmployees(), store.getSettings(),
+    ]);
+    if (!week) return sendJson(res, 404, { error: 'not_generated' });
+    const sheets = scheduleExport.buildScheduleSheets(params.weekStart, templates, employees, week.assignments, settings.companyName);
+    const buffer = xlsxWriter.buildWorkbook(sheets);
+    const asciiName = 'schedule-' + params.weekStart + '.xlsx';
+    const utf8Name = encodeURIComponent('לוז שבועי ' + params.weekStart + '.xlsx');
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': 'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + utf8Name,
+      'Content-Length': buffer.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(buffer);
   });
   route('POST', '/api/schedule/:weekStart/assign', async (req, res, params, body) => {
     const session = await requireSession(req);
