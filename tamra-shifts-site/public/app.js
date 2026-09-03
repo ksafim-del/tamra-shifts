@@ -618,6 +618,7 @@ function scheduleHtml() {
   }
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
+    + (week.generatedAt ? ('<a class="btn secondary sm" href="/api/schedule/' + wk + '/export.xlsx" download>⬇️ ייצוא לאקסל</a>') : '')
     + '</div></div>';
 
   html += '<div class="card"><div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
