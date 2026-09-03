@@ -6,6 +6,7 @@ const { initSchema, makeStore } = require('./store.js');
 const { createServer } = require('./server.js');
 const S = require('./schedule.js');
 const { buildFakeWorkbook, sampleRows } = require('./test-helpers/xlsx-fixture.js');
+const { readWorkbook } = require('./xlsx-truth.js');
 
 async function startTestServer() {
   const db = makeSqliteAdapter(':memory:');
@@ -258,4 +259,48 @@ test('POST /api/schedule/:weekStart/assign flags a conflict when the employee ha
   const emp2 = (await e2Res.json()).employee;
   const cleanAssign = await fetch(base + '/api/schedule/' + weekStart + '/assign', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ date: targetDate, shiftTemplateId: morning.id, employeeId: emp2.id }) });
   assert.strictEqual((await cleanAssign.json()).constraintConflict, false);
+});
+
+test('GET /api/schedule/:weekStart/export.xlsx: manager-only, 404 before generation, valid workbook after', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+  const eRes = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'דני כהן', roleId: 'fuel', pin: '1111' }) });
+  const emp = (await eRes.json()).employee;
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: emp.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+
+  // no session at all -> 403 (same convention as every other manager-only route in this file)
+  const noAuth = await fetch(base + '/api/schedule/2026-08-30/export.xlsx');
+  assert.strictEqual(noAuth.status, 403);
+
+  // employee session -> 403
+  const asEmployee = await fetch(base + '/api/schedule/2026-08-30/export.xlsx', { headers: { Cookie: empCookie } });
+  assert.strictEqual(asEmployee.status, 403);
+
+  // manager, but week not generated yet -> 404
+  const beforeGen = await fetch(base + '/api/schedule/2026-08-30/export.xlsx', { headers: { Cookie: mgrCookie } });
+  assert.strictEqual(beforeGen.status, 404);
+
+  await fetch(base + '/api/schedule/2026-08-30/generate', { method: 'POST', headers: { Cookie: mgrCookie } });
+
+  const res = await fetch(base + '/api/schedule/2026-08-30/export.xlsx', { headers: { Cookie: mgrCookie } });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  const disposition = res.headers.get('content-disposition');
+  assert.ok(disposition.includes('attachment'));
+  assert.ok(disposition.includes('schedule-2026-08-30.xlsx'), 'ascii fallback filename must be present');
+  assert.ok(disposition.includes("filename*=UTF-8''"), 'RFC 5987 UTF-8 filename must be present for the Hebrew name');
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  const wb = readWorkbook(buf);
+  assert.deepStrictEqual(wb.sheetNames, ['מתדלקים', 'עובדי חנות']);
+
+  const fuelSheet = wb.getSheet('מתדלקים');
+  assert.ok(fuelSheet.length >= 3, 'title row + header row + at least one data row');
+  assert.deepStrictEqual(fuelSheet[1], ['יום', 'תאריך', 'משמרת', 'שעות', 'עובד/ת']);
+  // the solo fuel employee should show up assigned to at least one shift somewhere in the sheet
+  assert.ok(fuelSheet.slice(2).some((row) => row[4] === 'דני כהן'), 'the generated employee should appear in the export');
 });
