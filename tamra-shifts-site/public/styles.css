@@ -51,7 +51,12 @@ h1, h2, h3, .btn, .tabbar, .seg, label { font-family: var(--font-ui); }
 td.mono, th.mono { text-align: right; }
 a { color: var(--accent); }
 .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px 48px; }
-.topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+/* padding-top adds env(safe-area-inset-top) on top of the normal 14px — when the site is
+   installed as a home-screen app (standalone/fullscreen) and the phone status bar overlays the
+   page content, this pushes the bar (and its logout/theme buttons) down below the status bar
+   instead of being covered by it and unreachable. env() resolves to 0 in a normal browser tab
+   and on non-notched devices, so this is always safe to include. */
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: calc(14px + env(safe-area-inset-top)) 16px 14px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
 .topbar .brand { font-weight: 800; font-size: 18px; }
 .topbar .brand small { display: block; font-weight: 400; font-size: 12px; color: var(--text-dim); }
 .tabbar { display: flex; gap: 4px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 8px 16px 0; background: var(--surface); border-bottom: 1px solid var(--border); }
