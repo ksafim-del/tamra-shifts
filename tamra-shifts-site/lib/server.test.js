@@ -299,8 +299,9 @@ test('GET /api/schedule/:weekStart/export.xlsx: manager-only, 404 before generat
   assert.deepStrictEqual(wb.sheetNames, ['מתדלקים', 'עובדי חנות']);
 
   const fuelSheet = wb.getSheet('מתדלקים');
-  assert.ok(fuelSheet.length >= 3, 'title row + header row + at least one data row');
-  assert.deepStrictEqual(fuelSheet[1], ['יום', 'תאריך', 'משמרת', 'שעות', 'עובד/ת']);
-  // the solo fuel employee should show up assigned to at least one shift somewhere in the sheet
-  assert.ok(fuelSheet.slice(2).some((row) => row[4] === 'דני כהן'), 'the generated employee should appear in the export');
+  assert.strictEqual(fuelSheet.length, 9, 'title row + header row + one row per day of the week (calendar layout)');
+  assert.deepStrictEqual(fuelSheet[1].slice(0, 2), ['יום', 'תאריך']);
+  assert.ok(fuelSheet[1].length > 2, 'a column per shift should follow the day/date columns');
+  // the solo fuel employee should show up assigned to at least one shift somewhere in the week grid
+  assert.ok(fuelSheet.slice(2).some((row) => row.some((cell) => cell === 'דני כהן')), 'the generated employee should appear in the export');
 });
