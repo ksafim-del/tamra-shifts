@@ -34,7 +34,7 @@ function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-f
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all' };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine' };
 
 /* ---------- api ---------- */
 function api(method, path, body) {
@@ -158,11 +158,11 @@ function handleAction(action, el, ev) {
   if (action === 'set-tab') { ui.tab = el.getAttribute('data-tab'); ui.modal = null; render(); ensureTabData(); return; }
   if (action === 'logout') { logout(); return; }
   if (action === 'close-modal') { closeModal(); return; }
-  if (action === 'theme-toggle') { toggleTheme(); return; }
 
   if (action === 'week-prev') { ui.currentWeek = addWeeks(ui.currentWeek, -1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-next') { ui.currentWeek = addWeeks(ui.currentWeek, 1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-gen-target') { ui.currentWeek = nextGenerationWeek(); render(); loadWeek(ui.currentWeek); return; }
+  if (action === 'toggle-my-schedule-view') { ui.myScheduleView = ui.myScheduleView === 'all' ? 'mine' : 'all'; render(); return; }
   if (action === 'set-schedule-role') { ui.scheduleRole = el.getAttribute('data-role'); render(); return; }
   if (action === 'set-employees-gender') { ui.employeesGender = el.getAttribute('data-gender'); render(); return; }
   if (action === 'month-prev') { ui.currentMonth = addMonths(ui.currentMonth, -1); render(); loadHours(ui.currentMonth); return; }
@@ -261,12 +261,6 @@ function handleAction(action, el, ev) {
     return;
   }
   if (action === 'clear-truth-hours') { CACHE.truthHours = null; ui.truthError = ''; render(); return; }
-}
-
-function toggleTheme() {
-  var root = document.documentElement;
-  var cur = root.getAttribute('data-theme');
-  root.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
 }
 
 /* ---------- forms ---------- */
@@ -472,7 +466,7 @@ function shellHtml() {
     }
   }
   return '<div class="topbar"><div class="brand">' + esc(STATE.settings.companyName || 'תמרה') + '<small>' + (isMgr ? 'ממשק ניהול' : esc(STATE.me ? STATE.me.name : '')) + '</small></div>'
-    + '<div style="display:flex;gap:8px;"><button class="iconbtn" data-action="theme-toggle">☀︎/☾</button><button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
+    + '<div style="display:flex;gap:8px;"><button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
     + '<div class="tabbar">' + tabs.map(function (t) { return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '"><span class="tab-ic">' + t[2] + '</span><span class="tab-lb">' + t[1] + '</span></button>'; }).join('') + '</div>'
     + '<div class="wrap">' + body + '</div>'
     + modalHtml();
@@ -707,23 +701,26 @@ function employeesHtml() {
 }
 
 /* ---------- requests (manager) ---------- */
-function swapRowHtml(s, showCandidates) {
+function swapRowHtml(s) {
   var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
   var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
   var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
-  var candCol = '';
-  if (showCandidates) {
-    var cands = s.candidates || [];
-    candCol = '<td>' + (cands.length ? cands.map(function (c) { return esc(c.name); }).join(', ') : '<span class="empty" style="padding:0;">אין מועמדים/ות זמינים/ות</span>') + '</td>';
-  }
   return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
     + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
     + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
     + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-    + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td>' + candCol + '</tr>';
+    + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td></tr>';
 }
 var SWAP_TABLE_HEAD = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead>';
-var SWAP_TABLE_HEAD_OPEN = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th><th>מועמדים/ות להחלפה</th></tr></thead>';
+// A candidates sub-row attached directly under its open request's row (instead of a dedicated
+// column) — reads far better on both narrow phone screens and wide desktop tables.
+function candidatesSubrowHtml(s, colspan) {
+  var cands = s.candidates || [];
+  return '<tr class="subrow"><td colspan="' + colspan + '">'
+    + '<span class="subrow-label">מועמדים/ות להחלפה:</span> '
+    + (cands.length ? cands.map(function (c) { return esc(c.name); }).join(', ') : '<span class="empty" style="padding:0;">אין מועמדים/ות זמינים/ות כרגע</span>')
+    + '</td></tr>';
+}
 
 /* ---------- requests (manager): availability grid ---------- */
 function availPillHtml(choice) {
@@ -758,13 +755,13 @@ function requestsHtml() {
 
   var html = '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
     + (open.length
-        ? ('<table class="xltable">' + SWAP_TABLE_HEAD_OPEN + '<tbody>' + open.map(function (s) { return swapRowHtml(s, true); }).join('') + '</tbody></table>')
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + open.map(function (s) { return swapRowHtml(s) + candidatesSubrowHtml(s, 7); }).join('') + '</tbody></table>')
         : '<div class="empty">אין בקשות פתוחות כרגע — הכול מטופל</div>')
     + '</div>';
 
   html += '<div class="card"><div class="card-head"><h2>בקשות סגורות</h2></div>'
     + (resolved.length
-        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(function (s) { return swapRowHtml(s, false); }).join('') + '</tbody></table>')
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(swapRowHtml).join('') + '</tbody></table>')
         : '<div class="empty">אין עדיין היסטוריה</div>')
     + '</div>';
 
@@ -856,13 +853,54 @@ function settingsHtml() {
 }
 
 /* ---------- employee: my schedule ---------- */
+// Read-only weekly grid of everyone's shifts (no assign/remove controls) — used by the
+// employee "לוז כל הצוות" toggle so employees can see who else is working, not just themselves.
+function teamScheduleHtml(wk, week) {
+  return '<div class="calgrid">' + [0, 1, 2, 3, 4, 5, 6].map(function (d) {
+    var ds = addDays(wk, d);
+    var dow = dowOfDateStr(ds);
+    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; })
+      .sort(function (a, b) { return timeToMinutes(a.start) - timeToMinutes(b.start); });
+    var body;
+    if (!templates.length) {
+      body = '<div class="calday-empty">אין משמרות מוגדרות</div>';
+    } else {
+      body = templates.map(function (t) {
+        var assigned = week.assignments.filter(function (a) { return a.date === ds && a.shiftTemplateId === t.id; });
+        var missing = t.needed - assigned.length;
+        var manualOnly = t.autoAssign === false;
+        var seniorIssue = t.roleId === 'fuel' && assigned.length > 0 && (week.seniorIssues || []).some(function (si) { return si.date === ds && si.shiftTemplateId === t.id; });
+        return '<div class="calevent ' + roleClass(t.roleId) + '">'
+          + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
+          + '<div class="cal-time mono">' + t.start + '–' + t.end + '</div>'
+          + '<div class="cal-emps">' + (assigned.length
+              ? assigned.map(function (a) {
+                  var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
+                  return '<span class="cal-chip' + (a.employeeId === STATE.me.id ? ' understaffed' : '') + '">' + esc(emp ? emp.name : '?') + (emp && emp.isSenior ? ' ⭐' : '') + '</span>';
+                }).join('')
+              : '<span class="cal-chip">— לא שובץ —</span>')
+          + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
+          + (seniorIssue ? '<span class="cal-chip understaffed">אין ותיק/ה</span>' : '')
+          + '</div></div>';
+      }).join('');
+    }
+    return '<div class="calday' + (ds === todayStr() ? ' today' : '') + '"><div class="calday-head"><div class="dname">' + dowName(dow) + '</div><div class="ddate">' + fmtDateShort(ds) + '</div></div><div class="calday-body">' + body + '</div></div>';
+  }).join('') + '</div>';
+}
 function myScheduleHtml() {
   var wk = ui.currentWeek;
   var week = CACHE.weeks[wk];
-  var html = '<div class="card"><div class="card-head"><h2>הלוז שלי — ' + weekLabel(wk) + '</h2>'
-    + '<div><button class="btn secondary sm" data-action="week-prev">◀</button> <button class="btn secondary sm" data-action="week-next">▶</button></div></div>';
+  var viewAll = ui.myScheduleView === 'all';
+  var html = '<div class="card"><div class="card-head"><h2>' + (viewAll ? 'הלוז של כולם — ' : 'הלוז שלי — ') + weekLabel(wk) + '</h2>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+    + '<button class="btn secondary sm" data-action="week-prev">◀</button> <button class="btn secondary sm" data-action="week-next">▶</button>'
+    + '<button class="btn ' + (viewAll ? '' : 'secondary') + ' sm" data-action="toggle-my-schedule-view">' + (viewAll ? '👤 הלוז שלי' : '👥 לוז כל הצוות') + '</button>'
+    + '</div></div>';
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
   if (!week.generatedAt) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
+
+  if (viewAll) { html += teamScheduleHtml(wk, week) + '</div>'; return html; }
+
   var mine = week.assignments.filter(function (a) { return a.employeeId === STATE.me.id; });
   var swaps = CACHE.swaps || [];
   html += '<div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
@@ -919,7 +957,7 @@ function myAvailabilityHtml() {
 }
 
 /* ---------- employee: my swaps ---------- */
-function mySwapRowHtml(s, showCandidates) {
+function mySwapRowHtml(s) {
   var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
   var isMine = s.requesterId === STATE.me.id;
   var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
@@ -928,28 +966,22 @@ function mySwapRowHtml(s, showCandidates) {
   if (!isMine && s.status === 'open') lastCol = '<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>';
   else if (isMine && s.status === 'open') lastCol = '<button class="btn sm danger" data-action="cancel-swap" data-id="' + s.id + '">ביטול בקשה</button>';
   else if (claimer) lastCol = 'נלקח ע"י ' + esc(claimer.name);
-  var candCol = '';
-  if (showCandidates) {
-    var cands = s.candidates || [];
-    candCol = '<td>' + (cands.length ? cands.map(function (c) { return esc(c.name); }).join(', ') : '<span class="empty" style="padding:0;">אין מועמדים/ות זמינים/ות</span>') + '</td>';
-  }
   return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
     + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
     + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
     + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-    + '<td>' + lastCol + '</td>' + candCol + '</tr>';
+    + '<td>' + lastCol + '</td></tr>';
 }
 function mySwapsHtml() {
   var swaps = (CACHE.swaps || []).filter(function (s) { return s.requesterId === STATE.me.id || s.roleId === STATE.me.roleId; });
   var open = swaps.filter(function (s) { return s.status === 'open'; });
   var closed = swaps.filter(function (s) { return s.status !== 'open'; });
-  var openHead = '<thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th><th>מועמדים/ות להחלפה</th></tr></thead>';
-  var closedHead = '<thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th></tr></thead>';
+  var head = '<thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th></tr></thead>';
   return '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
-    + (open.length ? ('<table class="xltable">' + openHead + '<tbody>' + open.map(function (s) { return mySwapRowHtml(s, true); }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות פתוחות כרגע</div>')
+    + (open.length ? ('<table class="xltable">' + head + '<tbody>' + open.map(function (s) { return mySwapRowHtml(s) + candidatesSubrowHtml(s, 6); }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות פתוחות כרגע</div>')
     + '</div>'
     + '<div class="card"><div class="card-head"><h2>בקשות סגורות</h2></div>'
-    + (closed.length ? ('<table class="xltable">' + closedHead + '<tbody>' + closed.map(function (s) { return mySwapRowHtml(s, false); }).join('') + '</tbody></table>') : '<div class="empty">אין עדיין היסטוריה</div>')
+    + (closed.length ? ('<table class="xltable">' + head + '<tbody>' + closed.map(mySwapRowHtml).join('') + '</tbody></table>') : '<div class="empty">אין עדיין היסטוריה</div>')
     + '</div>';
 }
 
@@ -991,7 +1023,7 @@ function modalHtml() {
         + (e && e.roleId === 'office' ? '<option value="office" selected>פקיד/ה (תפקיד שהוסר — אפשר לבחור תפקיד אחר)</option>' : '') + '</select></div>'
       + '<div class="field"><label>קוד PIN אישי</label><input name="pin" pattern="[0-9]{4,6}" required value="' + (e ? esc(e.pin||'') : '') + '"></div>'
       + '<div class="field"><label>מגדר</label><select name="gender" required><option value="">בחר/י</option><option value="male"' + (e && e.gender==='male'?' selected':'') + '>זכר</option><option value="female"' + (e && e.gender==='female'?' selected':'') + '>נקבה</option></select></div>'
-      + '<div class="field"><label><input type="checkbox" name="isSenior" style="width:auto;display:inline-block;"' + (e && e.isSenior ? ' checked' : '') + '> מתדלק/ת ותיק/ה <span style="font-weight:400;color:var(--text-dim);">(רלוונטי למתדלקים בלבד — בכל משמרת מתדלקים חייב להיות משובץ לפחות מתדלק/ת ותיק/ה אחד/ת)</span></label></div>'
+      + '<div class="field"><label><input type="checkbox" name="isSenior" style="width:auto;display:inline-block;"' + (e && e.isSeniorManual ? ' checked' : '') + '> מתדלק/ת ותיק/ה <span style="font-weight:400;color:var(--text-dim);">(רלוונטי למתדלקים בלבד — בכל משמרת מתדלקים חייב להיות משובץ לפחות מתדלק/ת ותיק/ה אחד/ת. כל מתדלק/ת מקבל/ת ותק אוטומטית אחרי חודשיים במערכת — אפשר גם לסמן ידנית מוקדם יותר)</span></label></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
   } else if (m.type === 'confirm-swap') {
