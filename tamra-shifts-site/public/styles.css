@@ -12,41 +12,21 @@
   --ok: #2f7a4d;
   --warn: #b3781a;
   --err: #b3341f;
-  --radius: 12px;
-  --font-ui: 'Heebo', system-ui, sans-serif;
-  --font-body: 'Assistant', system-ui, sans-serif;
+  --radius: 14px;
+  --font-ui: 'Rubik', system-ui, sans-serif;
+  --font-body: 'Rubik', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #171310;
-    --surface: #211b16;
-    --surface-2: #2a231c;
-    --border: #3a3129;
-    --text: #f3ece1;
-    --text-dim: #b7ab9c;
-    --accent: #ea8a3d;
-    --accent-ink: #ffd9ae;
-    --deep: #3a6a8a;
-    --deep-ink: #ffffff;
-    --ok: #5cb87f;
-    --warn: #e0a83e;
-    --err: #e2685a;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #171310; --surface: #211b16; --surface-2: #2a231c; --border: #3a3129;
-  --text: #f3ece1; --text-dim: #b7ab9c; --accent: #ea8a3d; --accent-ink: #ffd9ae;
-  --deep: #3a6a8a; --deep-ink: #ffffff; --ok: #5cb87f; --warn: #e0a83e; --err: #e2685a;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   background: var(--bg); color: var(--text); font-family: var(--font-body);
-  direction: rtl; min-height: 100vh; font-size: 15px; line-height: 1.5;
+  direction: rtl; min-height: 100vh; font-size: 15px; line-height: 1.55;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
 }
-h1, h2, h3, .btn, .tabbar, .seg, label { font-family: var(--font-ui); }
+h1, h2, h3, .btn, .tabbar, .seg, label { font-family: var(--font-ui); letter-spacing: -0.01em; }
+h1, h2, h3 { font-weight: 700; }
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; direction: ltr; unicode-bidi: isolate; }
 td.mono, th.mono { text-align: right; }
 a { color: var(--accent); }
@@ -56,25 +36,26 @@ a { color: var(--accent); }
    page content, this pushes the bar (and its logout/theme buttons) down below the status bar
    instead of being covered by it and unreachable. env() resolves to 0 in a normal browser tab
    and on non-notched devices, so this is always safe to include. */
-.topbar { display: flex; align-items: center; justify-content: space-between; padding: calc(14px + env(safe-area-inset-top)) 16px 14px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
-.topbar .brand { font-weight: 800; font-size: 18px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: calc(14px + env(safe-area-inset-top)) 16px 14px; background: var(--surface); border-bottom: 1px solid var(--border); box-shadow: 0 1px 6px rgba(20,15,8,.04); position: sticky; top: 0; z-index: 10; }
+.topbar .brand { font-weight: 800; font-size: 18px; letter-spacing: -0.01em; }
 .topbar .brand small { display: block; font-weight: 400; font-size: 12px; color: var(--text-dim); }
 .tabbar { display: flex; gap: 4px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 8px 16px 0; background: var(--surface); border-bottom: 1px solid var(--border); }
 .tabbar button { border: none; background: none; padding: 12px 16px; font-size: 14px; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; -webkit-tap-highlight-color: transparent; transition: color .15s ease, background .15s ease; display: inline-flex; align-items: center; gap: 6px; touch-action: manipulation; }
 .tabbar button:hover { color: var(--text); }
 .tabbar button.active { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 700; }
 .tabbar button .tab-ic { font-size: 15px; line-height: 1; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; margin: 16px 0; box-shadow: 0 1px 2px rgba(20,15,8,.04), 0 2px 12px rgba(20,15,8,.05); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin: 16px 0; box-shadow: 0 1px 2px rgba(20,15,8,.04), 0 4px 16px rgba(20,15,8,.05); overflow-x: auto; -webkit-overflow-scrolling: touch; transition: box-shadow .2s ease; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 .card-head h2 { margin: 0; font-size: 18px; }
-.btn { display: inline-flex; align-items: center; gap: 6px; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; min-height: 40px; font-size: 14px; font-weight: 600; cursor: pointer; transition: filter .15s ease, transform .05s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
-.btn:hover { filter: brightness(1.07); }
+.btn { display: inline-flex; align-items: center; gap: 6px; background: var(--accent); color: #fff; border: none; border-radius: 9px; padding: 10px 18px; min-height: 40px; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(20,15,8,.08); transition: filter .15s ease, transform .05s ease, box-shadow .15s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.btn:hover { filter: brightness(1.07); box-shadow: 0 2px 8px rgba(217,119,43,.25); }
 .btn:active { transform: translateY(1px); }
-.btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+.btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); box-shadow: none; }
+.btn.secondary:hover { box-shadow: none; background: var(--border); }
 .btn.danger { background: var(--err); color: #fff; }
 .btn.sm { padding: 8px 12px; min-height: 34px; font-size: 13px; }
-.btn:disabled { opacity: .5; cursor: not-allowed; transform: none; filter: none; }
-.iconbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; min-height: 32px; font-size: 12px; cursor: pointer; color: var(--text); transition: background .15s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.btn:disabled { opacity: .5; cursor: not-allowed; transform: none; filter: none; box-shadow: none; }
+.iconbtn { background: none; border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; min-height: 32px; font-size: 12px; cursor: pointer; color: var(--text); transition: background .15s ease; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .iconbtn:hover { background: var(--surface-2); }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: right; }
@@ -83,6 +64,8 @@ table.xltable, table.xltable th, table.xltable td { border: 1px solid var(--bord
 table.xltable th { background: var(--surface-2); color: var(--text); }
 table.xltable tbody tr:nth-child(even) td { background: var(--surface-2); }
 table.xltable td, table.xltable th { vertical-align: top; }
+table.xltable tr.subrow td { background: var(--surface-2); border-top: none; font-size: 12.5px; color: var(--text-dim); padding: 6px 10px 10px; }
+table.xltable tr.subrow .subrow-label { font-weight: 700; color: var(--text); }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .pill.status-open { background: #fdeccb; color: #7a4a0c; }
 .pill.status-claimed { background: #d8f0dd; color: #1e5c33; }
@@ -151,7 +134,7 @@ table.xltable td, table.xltable th { vertical-align: top; }
    reflow to fewer per row on a tablet, and stack one-per-row (full width) on a phone — see the
    breakpoints below. No swiping/scrolling needed to see the whole week on any screen size. */
 .calgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; align-items: start; }
-.calday { width: 100%; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0; overflow: hidden; box-shadow: 0 1px 3px rgba(20,15,8,.05); transition: box-shadow .15s ease; }
+.calday { width: 100%; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0; overflow: hidden; box-shadow: 0 1px 3px rgba(20,15,8,.05); transition: box-shadow .15s ease; }
 .calday.today { box-shadow: 0 0 0 2px var(--accent), 0 2px 8px rgba(20,15,8,.08); }
 .calday-head { text-align: center; padding: 10px 8px; background: var(--surface-2); border-bottom: 1px solid var(--border); }
 .calday-head .dname { font-weight: 800; font-size: 14px; }
