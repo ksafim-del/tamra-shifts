@@ -1,5 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
+const S = require('./schedule.js');
 
 function uid() { return crypto.randomBytes(9).toString('base64url'); }
 
@@ -320,7 +321,14 @@ async function initSchema(db) {
 }
 
 function rowToEmployee(r, includePin) {
-  const e = { id: r.id, name: r.name, roleId: r.role_id, active: !!r.active, maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null, isSenior: !!r.is_senior };
+  const createdAt = r.created_at != null ? Number(r.created_at) : null;
+  const isSeniorManual = !!r.is_senior;
+  const e = {
+    id: r.id, name: r.name, roleId: r.role_id, active: !!r.active,
+    maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null,
+    createdAt: createdAt, isSeniorManual: isSeniorManual,
+    isSenior: S.isEffectivelySenior({ isSeniorManual: isSeniorManual, roleId: r.role_id, createdAt: createdAt }),
+  };
   if (includePin) e.pin = r.pin;
   return e;
 }
@@ -457,9 +465,15 @@ function makeStore(db) {
       // assignments (not frozen at generation time) — an employee's senior flag can change, or a
       // manual reassignment can fix the gap, after the week was generated, and this should reflect
       // that immediately rather than showing a stale issue forever.
-      const employeeRows = await db.all('SELECT id, is_senior FROM employees', []);
+      const employeeRows = await db.all('SELECT id, is_senior, role_id, created_at FROM employees', []);
       const seniorById = {};
-      employeeRows.forEach(e => { seniorById[e.id] = !!e.is_senior; });
+      const nowMs = Date.now();
+      employeeRows.forEach(e => {
+        seniorById[e.id] = S.isEffectivelySenior({
+          isSeniorManual: !!e.is_senior, roleId: e.role_id,
+          createdAt: e.created_at != null ? Number(e.created_at) : null,
+        }, nowMs);
+      });
       const byFuelShift = {};
       mappedAssignments.forEach(a => {
         if (roleById[a.shiftTemplateId] !== 'fuel') return;
