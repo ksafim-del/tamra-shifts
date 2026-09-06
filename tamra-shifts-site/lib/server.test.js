@@ -139,7 +139,7 @@ test('employee can cancel their own open swap request, but not someone else\'s',
   assert.ok(!swapsAfter.swaps.some(s => s.id === swapId), 'cancelled request should be gone');
 });
 
-test('constraint deadline enforcement over HTTP (locked week rejected, far week accepted)', async (t) => {
+test('availability submission deadline enforcement over HTTP (locked week rejected, far week accepted)', async (t) => {
   const { server, base } = await startTestServer();
   t.after(() => server.close());
   const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
@@ -155,17 +155,20 @@ test('constraint deadline enforcement over HTTP (locked week rejected, far week 
   const nextWeekLocked = S.constraintDeadlinePassed('2099-01-06', 4, now); // arbitrary far week for structural check only
   assert.strictEqual(typeof nextWeekLocked, 'boolean');
 
-  // Use a date far enough in the future that it is provably still open regardless of "today".
-  const farDate = S.addDays(S.todayStr(), 60);
-  const okRes = await fetch(base + '/api/constraints', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'date', date: farDate, allDay: true }) });
+  function fullWeekDays(weekStart) {
+    return [0, 1, 2, 3, 4, 5, 6].map(d => ({ date: S.addDays(weekStart, d), choice: 'all' }));
+  }
+
+  // Use a week far enough in the future that it is provably still open regardless of "today".
+  const farWeek = S.weekKeyOf(S.addDays(S.todayStr(), 60));
+  const okRes = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart: farWeek, days: fullWeekDays(farWeek) }) });
   assert.strictEqual(okRes.status, 200);
 
-  // A date inside the immediately-next generation week (already locked as of "now") must be rejected.
+  // The immediately-next generation week (already locked as of "now") must be rejected.
   const lockedWeek = S.nextGenerationWeek();
-  const lockedDate = S.addDays(lockedWeek, 2);
-  const blockedRes = await fetch(base + '/api/constraints', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'date', date: lockedDate, allDay: true }) });
+  const blockedRes = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart: lockedWeek, days: fullWeekDays(lockedWeek) }) });
   // Whether this is actually locked depends on "today" vs the deadline; assert consistency with the pure function instead of a hardcoded expectation.
-  const shouldBeLocked = S.constraintDeadlinePassed(lockedDate, 4);
+  const shouldBeLocked = S.constraintDeadlinePassed(lockedWeek, 4);
   assert.strictEqual(blockedRes.status, shouldBeLocked ? 409 : 200);
 });
 
@@ -221,7 +224,7 @@ test('POST /api/hours/truth: manager-only, parses the uploaded attendance .xlsx 
   assert.ok(body.unmatched.every((u) => u.fileName !== 'מרווה עאבד'));
 });
 
-test('POST /api/schedule/:weekStart/assign flags a conflict when the employee has a blocking constraint, but still assigns (manager override)', async (t) => {
+test('POST /api/schedule/:weekStart/assign flags a conflict when the employee marked themselves unavailable, but still assigns (manager override)', async (t) => {
   const { server, base } = await startTestServer();
   t.after(() => server.close());
   const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
@@ -240,8 +243,11 @@ test('POST /api/schedule/:weekStart/assign flags a conflict when the employee ha
 
   const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: emp.id, pin: '1111' }) });
   const empCookie = extractCookie(empLogin);
-  const constraintRes = await fetch(base + '/api/constraints', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'date', date: targetDate, allDay: true }) });
-  assert.strictEqual(constraintRes.status, 200);
+  // Employee marks themselves unavailable ('none') on the target date, available every other day
+  // of that week — submitted as a full 7-day week, as the real UI always does.
+  const availDays = [0, 1, 2, 3, 4, 5, 6].map(d => { const ds = S.addDays(weekStart, d); return { date: ds, choice: ds === targetDate ? 'none' : 'all' }; });
+  const availRes = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days: availDays }) });
+  assert.strictEqual(availRes.status, 200);
 
   const assignRes = await fetch(base + '/api/schedule/' + weekStart + '/assign', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ date: targetDate, shiftTemplateId: morning.id, employeeId: emp.id }) });
   assert.strictEqual(assignRes.status, 200);
@@ -304,4 +310,97 @@ test('GET /api/schedule/:weekStart/export.xlsx: manager-only, 404 before generat
   assert.ok(fuelSheet[1].length > 2, 'a column per shift should follow the day/date columns');
   // the solo fuel employee should show up assigned to at least one shift somewhere in the week grid
   assert.ok(fuelSheet.slice(2).some((row) => row.some((cell) => cell === 'דני כהן')), 'the generated employee should appear in the export');
+});
+
+test('GET/POST /api/availability: employee submits a full week, manager can read everyone\'s picks, partial/invalid submissions are rejected', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+  const eRes = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד1', roleId: 'fuel', pin: '1111' }) });
+  const emp = (await eRes.json()).employee;
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: emp.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+
+  const weekStart = S.weekKeyOf(S.addDays(S.todayStr(), 60));
+  const choices = ['all', 'morning', 'noon', 'night', 'none', 'all', 'morning'];
+  const days = [0, 1, 2, 3, 4, 5, 6].map(d => ({ date: S.addDays(weekStart, d), choice: choices[d] }));
+
+  // missing a day -> rejected
+  const partial = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days: days.slice(0, 6) }) });
+  assert.strictEqual(partial.status, 400);
+
+  // an invalid choice string -> rejected
+  const badChoice = days.slice(); badChoice[0] = { date: days[0].date, choice: 'afternoon-nap' };
+  const invalid = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days: badChoice }) });
+  assert.strictEqual(invalid.status, 400);
+
+  const okRes = await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days }) });
+  assert.strictEqual(okRes.status, 200);
+
+  const mine = await (await fetch(base + '/api/availability?weekStart=' + weekStart, { headers: { Cookie: empCookie } })).json();
+  assert.strictEqual(mine.availability.length, 7);
+  assert.ok(mine.availability.every(a => a.employeeId === emp.id));
+
+  // resubmitting the same week replaces the old picks rather than duplicating them
+  const days2 = days.map(d => Object.assign({}, d, { choice: 'all' }));
+  await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days: days2 }) });
+  const mineAgain = await (await fetch(base + '/api/availability?weekStart=' + weekStart, { headers: { Cookie: empCookie } })).json();
+  assert.strictEqual(mineAgain.availability.length, 7, 'resubmitting must not leave duplicate rows');
+  assert.ok(mineAgain.availability.every(a => a.choice === 'all'));
+
+  // manager can see the same employee's picks for that week without an employeeId filter
+  const mgrView = await (await fetch(base + '/api/availability?weekStart=' + weekStart, { headers: { Cookie: mgrCookie } })).json();
+  assert.strictEqual(mgrView.availability.length, 7);
+});
+
+test('generateSchedule via HTTP: a fuel shift staffed without any senior fuel attendant is surfaced as seniorIssues, and clears once a senior covers it', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+  // a single, non-senior fuel employee: every fuel shift they cover is understaffed for seniority
+  await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד1', roleId: 'fuel', pin: '1111', isSenior: false }) });
+
+  const genRes = await fetch(base + '/api/schedule/2026-08-30/generate', { method: 'POST', headers: { Cookie: mgrCookie } });
+  const genBody = await genRes.json();
+  assert.strictEqual(genRes.status, 200);
+  assert.ok(genBody.week.seniorIssues.length > 0, 'a fuel shift staffed by only a non-senior employee should be flagged');
+
+  const notifs = await (await fetch(base + '/api/notifications', { headers: { Cookie: mgrCookie } })).json();
+  assert.ok(notifs.notifications.some(n => n.type === 'no-senior-fuel'), 'manager should be notified about the missing senior coverage');
+});
+
+test('GET /api/swaps attaches potential-replacement candidates to open requests only, based on submitted availability', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+  const e1res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד1', roleId: 'fuel', pin: '1111' }) });
+  const e1 = (await e1res.json()).employee;
+  const e2res = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד2', roleId: 'fuel', pin: '2222' }) });
+  const e2 = (await e2res.json()).employee;
+  await fetch(base + '/api/schedule/2026-08-30/generate', { method: 'POST', headers: { Cookie: mgrCookie } });
+
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: e1.id, pin: '1111' }) });
+  const empCookie = extractCookie(empLogin);
+  const week = await (await fetch(base + '/api/schedule/2026-08-30', { headers: { Cookie: empCookie } })).json();
+  const myAssignment = week.week.assignments.find(a => a.employeeId === e1.id);
+  await fetch(base + '/api/assignment/' + myAssignment.id + '/swap-request', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ kind: 'swap' }) });
+
+  // e2 hasn't submitted availability at all -> defaults to available -> should appear as a candidate
+  const swaps1 = await (await fetch(base + '/api/swaps?status=open', { headers: { Cookie: mgrCookie } })).json();
+  const openSwap1 = swaps1.swaps.find(s => s.assignmentId === myAssignment.id);
+  assert.ok(openSwap1.candidates.some(c => c.id === e2.id), 'an employee with no submission yet defaults to available and should be suggested');
+
+  // e2 explicitly marks themselves unavailable that whole day -> should drop out of candidates
+  const days = [0, 1, 2, 3, 4, 5, 6].map(d => ({ date: S.addDays('2026-08-30', d), choice: d === 0 ? 'none' : 'all' }));
+  await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ employeeId: e2.id, weekStart: '2026-08-30', days }) });
+  const swaps2 = await (await fetch(base + '/api/swaps?status=open', { headers: { Cookie: mgrCookie } })).json();
+  const openSwap2 = swaps2.swaps.find(s => s.assignmentId === myAssignment.id);
+  assert.ok(!openSwap2.candidates.some(c => c.id === e2.id), 'an employee who marked themselves unavailable must not be suggested');
+
+  // resolved (non-open) requests don't carry a candidates computation at all
+  const closedSwaps = await (await fetch(base + '/api/swaps?status=claimed', { headers: { Cookie: mgrCookie } })).json();
+  assert.deepStrictEqual(closedSwaps.swaps.map(s => s.candidates), closedSwaps.swaps.map(() => []));
 });
