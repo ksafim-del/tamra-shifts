@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS employees (
   active INTEGER NOT NULL DEFAULT 1,
   max_shifts_per_week INTEGER,
   gender TEXT,
+  is_senior INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shift_templates (
@@ -59,6 +60,20 @@ CREATE TABLE IF NOT EXISTS constraints (
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_constraints_emp ON constraints(employee_id);
+-- Replaces the free-form "constraints" model above for new submissions: each employee picks one
+-- choice ('all' | 'morning' | 'noon' | 'night' | 'none') per day for the week being generated,
+-- instead of listing ad-hoc blocked date/time ranges. The constraints table and its API/DB
+-- methods are left in place (harmless, unused by the current UI) rather than dropped, so no
+-- historical data is lost.
+CREATE TABLE IF NOT EXISTS availability (
+  id TEXT PRIMARY KEY,
+  employee_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  choice TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_availability_emp ON availability(employee_id);
+CREATE INDEX IF NOT EXISTS idx_availability_date ON availability(date);
 CREATE TABLE IF NOT EXISTS swap_requests (
   id TEXT PRIMARY KEY,
   assignment_id TEXT NOT NULL,
@@ -143,6 +158,7 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS gender TEXT',
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS required_gender TEXT',
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS allow_extra INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_senior INTEGER NOT NULL DEFAULT 0',
   ];
   for (const s of alters) {
     try { await db.exec(s); } catch (e) { console.warn('[migrate]', s, '->', e.message); }
@@ -304,9 +320,12 @@ async function initSchema(db) {
 }
 
 function rowToEmployee(r, includePin) {
-  const e = { id: r.id, name: r.name, roleId: r.role_id, active: !!r.active, maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null };
+  const e = { id: r.id, name: r.name, roleId: r.role_id, active: !!r.active, maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null, isSenior: !!r.is_senior };
   if (includePin) e.pin = r.pin;
   return e;
+}
+function rowToAvailability(r) {
+  return { id: r.id, employeeId: r.employee_id, date: r.date, choice: r.choice, createdAt: Number(r.created_at) };
 }
 function rowToTemplate(r) {
   return { id: r.id, roleId: r.role_id, label: r.label, start: r.start_time, end: r.end_time, needed: r.needed, days: JSON.parse(r.days), active: !!r.active, autoAssign: r.auto_assign == null ? true : !!r.auto_assign, requiredGender: r.required_gender || null, allowExtra: !!r.allow_extra };
@@ -355,11 +374,11 @@ function makeStore(db) {
       const row = await db.get('SELECT * FROM employees WHERE id = ? AND pin = ? AND active = 1', [id, pin]);
       return row ? rowToEmployee(row, true) : null;
     },
-    async createEmployee({ name, roleId, pin, maxShiftsPerWeek, gender }) {
+    async createEmployee({ name, roleId, pin, maxShiftsPerWeek, gender, isSenior }) {
       const id = uid();
       await db.run(
-        'INSERT INTO employees (id, name, role_id, pin, active, max_shifts_per_week, gender, created_at) VALUES (?,?,?,?,1,?,?,?)',
-        [id, name, roleId, pin, maxShiftsPerWeek || null, gender || null, Date.now()]
+        'INSERT INTO employees (id, name, role_id, pin, active, max_shifts_per_week, gender, is_senior, created_at) VALUES (?,?,?,?,1,?,?,?,?)',
+        [id, name, roleId, pin, maxShiftsPerWeek || null, gender || null, isSenior ? 1 : 0, Date.now()]
       );
       return this.getEmployee(id);
     },
@@ -373,9 +392,10 @@ function makeStore(db) {
         active: patch.active != null ? (patch.active ? 1 : 0) : cur.active,
         max_shifts_per_week: patch.maxShiftsPerWeek !== undefined ? patch.maxShiftsPerWeek : cur.max_shifts_per_week,
         gender: patch.gender != null ? patch.gender : cur.gender,
+        is_senior: patch.isSenior != null ? (patch.isSenior ? 1 : 0) : cur.is_senior,
       };
-      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=?, gender=? WHERE id=?',
-        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, next.gender, id]);
+      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=?, gender=?, is_senior=? WHERE id=?',
+        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, next.gender, next.is_senior, id]);
       return this.getEmployee(id);
     },
 
@@ -419,9 +439,10 @@ function makeStore(db) {
       // then silently wiped out the moment someone did generate (generateWeek only skips an
       // already-generated week, and without this a manually-assigned week never counted as one).
       if (!row && !assignments.length) return null;
-      const templateRows = await db.all('SELECT id, active FROM shift_templates', []);
+      const templateRows = await db.all('SELECT id, active, role_id FROM shift_templates', []);
       const activeById = {};
-      templateRows.forEach(t => { activeById[t.id] = !!t.active; });
+      const roleById = {};
+      templateRows.forEach(t => { activeById[t.id] = !!t.active; roleById[t.id] = t.role_id; });
       // Drop stale understaffed entries left over from a shift template that has since been
       // deactivated/removed (e.g. the old office role) — the "understaffed" list is a snapshot
       // taken at generation time and never rewritten, so a role removed afterwards would
@@ -431,7 +452,24 @@ function makeStore(db) {
       const understaffed = row
         ? JSON.parse(row.understaffed).filter(u => !Object.prototype.hasOwnProperty.call(activeById, u.shiftTemplateId) || activeById[u.shiftTemplateId])
         : [];
-      return { weekStart, understaffed, generatedAt: row ? Number(row.generated_at) : null, assignments: assignments.map(rowToAssignment) };
+      const mappedAssignments = assignments.map(rowToAssignment);
+      // "senior fuel attendant" coverage is computed live from the current roster and
+      // assignments (not frozen at generation time) — an employee's senior flag can change, or a
+      // manual reassignment can fix the gap, after the week was generated, and this should reflect
+      // that immediately rather than showing a stale issue forever.
+      const employeeRows = await db.all('SELECT id, is_senior FROM employees', []);
+      const seniorById = {};
+      employeeRows.forEach(e => { seniorById[e.id] = !!e.is_senior; });
+      const byFuelShift = {};
+      mappedAssignments.forEach(a => {
+        if (roleById[a.shiftTemplateId] !== 'fuel') return;
+        const key = a.date + '|' + a.shiftTemplateId;
+        (byFuelShift[key] = byFuelShift[key] || []).push(a.employeeId);
+      });
+      const seniorIssues = Object.keys(byFuelShift)
+        .filter(key => !byFuelShift[key].some(empId => seniorById[empId]))
+        .map(key => { const [date, shiftTemplateId] = key.split('|'); return { date, shiftTemplateId }; });
+      return { weekStart, understaffed, seniorIssues, generatedAt: row ? Number(row.generated_at) : null, assignments: mappedAssignments };
     },
     async listAllWeekKeys() {
       const rows = await db.all('SELECT week_start FROM schedules ORDER BY week_start ASC', []);
@@ -485,6 +523,29 @@ function makeStore(db) {
     async deleteConstraint(id, employeeId) {
       if (employeeId) return db.run('DELETE FROM constraints WHERE id = ? AND employee_id = ?', [id, employeeId]);
       return db.run('DELETE FROM constraints WHERE id = ?', [id]);
+    },
+
+    // ---- availability (the 5-choice-per-day model that replaced free-form constraints) ----
+    async listAvailability({ employeeId, fromDate, toDate } = {}) {
+      let sql = 'SELECT * FROM availability WHERE 1=1';
+      const args = [];
+      if (employeeId) { sql += ' AND employee_id = ?'; args.push(employeeId); }
+      if (fromDate) { sql += ' AND date >= ?'; args.push(fromDate); }
+      if (toDate) { sql += ' AND date <= ?'; args.push(toDate); }
+      sql += ' ORDER BY date ASC';
+      const rows = await db.all(sql, args);
+      return rows.map(rowToAvailability);
+    },
+    // Replaces one employee's entire set of picks for the given dates in one call (the UI always
+    // submits a full week — 7 days — at once). Delete-then-insert per date rather than a
+    // dialect-specific upsert, since this is small, infrequent, and needs to work identically on
+    // both SQLite and Postgres.
+    async setWeekAvailability(employeeId, days) {
+      for (const d of days) {
+        await db.run('DELETE FROM availability WHERE employee_id = ? AND date = ?', [employeeId, d.date]);
+        await db.run('INSERT INTO availability (id, employee_id, date, choice, created_at) VALUES (?,?,?,?,?)',
+          [uid(), employeeId, d.date, d.choice, Date.now()]);
+      }
     },
 
     async createSwapRequest(s) {
