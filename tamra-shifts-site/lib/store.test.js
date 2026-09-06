@@ -234,6 +234,70 @@ test('employee gender is stored and editable', async () => {
   assert.strictEqual(updated.gender, 'male');
 });
 
+test('employee isSenior ("מתדלק ותיק") flag is stored, defaults to false, and is editable', async () => {
+  const store = await freshStore();
+  const e = await store.createEmployee({ name: 'עובד1', roleId: 'fuel', pin: '1111' });
+  assert.strictEqual(e.isSenior, false, 'defaults to false when not specified');
+  const senior = await store.createEmployee({ name: 'עובד2', roleId: 'fuel', pin: '2222', isSenior: true });
+  assert.strictEqual(senior.isSenior, true);
+  const updated = await store.updateEmployee(e.id, { isSenior: true });
+  assert.strictEqual(updated.isSenior, true);
+  const revertedBack = await store.updateEmployee(e.id, { isSenior: false });
+  assert.strictEqual(revertedBack.isSenior, false);
+});
+
+test('availability: setWeekAvailability replaces (not duplicates) a week\'s picks, listAvailability filters by employee and/or date range', async () => {
+  const store = await freshStore();
+  const e1 = await store.createEmployee({ name: 'עובד1', roleId: 'fuel', pin: '1111' });
+  const e2 = await store.createEmployee({ name: 'עובד2', roleId: 'fuel', pin: '2222' });
+  const week1 = ['2026-08-30','2026-08-31','2026-09-01','2026-09-02','2026-09-03','2026-09-04','2026-09-05']
+    .map((d, i) => ({ date: d, choice: ['all','morning','noon','night','none','all','morning'][i] }));
+  await store.setWeekAvailability(e1.id, week1);
+  await store.setWeekAvailability(e2.id, week1.map(d => Object.assign({}, d, { choice: 'all' })));
+
+  const e1Week = await store.listAvailability({ employeeId: e1.id, fromDate: '2026-08-30', toDate: '2026-09-05' });
+  assert.strictEqual(e1Week.length, 7);
+  assert.strictEqual(e1Week.find(a => a.date === '2026-09-03').choice, 'none');
+
+  // resubmitting the same week for e1 must replace, not duplicate
+  await store.setWeekAvailability(e1.id, week1.map(d => Object.assign({}, d, { choice: 'all' })));
+  const e1WeekAgain = await store.listAvailability({ employeeId: e1.id, fromDate: '2026-08-30', toDate: '2026-09-05' });
+  assert.strictEqual(e1WeekAgain.length, 7, 'must still be exactly 7 rows, not 14');
+  assert.ok(e1WeekAgain.every(a => a.choice === 'all'));
+
+  // no employeeId filter -> both employees' rows for that date range
+  const everyone = await store.listAvailability({ fromDate: '2026-08-30', toDate: '2026-09-05' });
+  assert.strictEqual(everyone.length, 14);
+
+  // a date-range filter narrower than the full week only returns the matching days
+  const oneDay = await store.listAvailability({ employeeId: e2.id, fromDate: '2026-09-01', toDate: '2026-09-01' });
+  assert.strictEqual(oneDay.length, 1);
+  assert.strictEqual(oneDay[0].date, '2026-09-01');
+});
+
+test('getScheduleWeek computes seniorIssues live from current assignments/roster: flags a fuel shift with no senior, ignores store, and clears once a senior is assigned', async () => {
+  const store = await freshStore();
+  const junior = await store.createEmployee({ name: 'ג׳וניור', roleId: 'fuel', pin: '1111', isSenior: false });
+  const senior = await store.createEmployee({ name: 'ותיק', roleId: 'fuel', pin: '2222', isSenior: true });
+  const storeEmp = await store.createEmployee({ name: 'חנות', roleId: 'store', pin: '3333' });
+  await store.createShiftTemplate({ roleId: 'fuel', label: 'x', start: '05:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6] });
+  const realFuelId = (await store.listShiftTemplates()).find(t => t.roleId === 'fuel' && t.label === 'x').id;
+  await store.createShiftTemplate({ roleId: 'store', label: 'y', start: '06:00', end: '13:00', needed: 1, days: [0,1,2,3,4,5,6] });
+  const realStoreId = (await store.listShiftTemplates()).find(t => t.roleId === 'store' && t.label === 'y').id;
+  await store.saveGeneratedSchedule('2026-08-30', [
+    { date: '2026-08-30', shiftTemplateId: realFuelId, employeeId: junior.id },
+    { date: '2026-08-30', shiftTemplateId: realStoreId, employeeId: storeEmp.id },
+  ], [], Date.now());
+
+  const week1 = await store.getScheduleWeek('2026-08-30');
+  assert.deepStrictEqual(week1.seniorIssues, [{ date: '2026-08-30', shiftTemplateId: realFuelId }], 'fuel shift with only a junior employee is flagged; store is never flagged');
+
+  // add the senior onto the same fuel shift -> the issue clears, computed live (not frozen)
+  await store.addAssignment('2026-08-30', '2026-08-30', realFuelId, senior.id);
+  const week2 = await store.getScheduleWeek('2026-08-30');
+  assert.deepStrictEqual(week2.seniorIssues, [], 'coverage now includes a senior, so the issue clears immediately');
+});
+
 test('BIGINT timestamp fields always come back as JS numbers (Postgres returns BIGINT as strings)', async () => {
   const store = await freshStore();
   const e = await store.createEmployee({ name: 'E1', roleId: 'fuel', pin: '1111' });
