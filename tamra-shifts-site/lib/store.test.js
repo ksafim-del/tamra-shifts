@@ -246,6 +246,25 @@ test('employee isSenior ("מתדלק ותיק") flag is stored, defaults to fals
   assert.strictEqual(revertedBack.isSenior, false);
 });
 
+test('a fuel attendant automatically becomes "senior" once employed more than two months, without ever setting the manual flag; a store employee never auto-promotes', async () => {
+  const db = makeSqliteAdapter(':memory:');
+  await initSchema(db);
+  const store = makeStore(db);
+  const fuelEmp = await store.createEmployee({ name: 'מתדלק ותיק בפוטנציה', roleId: 'fuel', pin: '1111' });
+  const storeEmp = await store.createEmployee({ name: 'עובד חנות ותיק', roleId: 'store', pin: '2222' });
+  assert.strictEqual(fuelEmp.isSenior, false, 'freshly hired, not senior yet');
+
+  const threeMonthsAgo = Date.now() - 93 * 24 * 60 * 60 * 1000;
+  await db.run('UPDATE employees SET created_at = ? WHERE id IN (?, ?)', [threeMonthsAgo, fuelEmp.id, storeEmp.id]);
+
+  const list = await store.listEmployees();
+  const fuelAfter = list.find((e) => e.id === fuelEmp.id);
+  const storeAfter = list.find((e) => e.id === storeEmp.id);
+  assert.strictEqual(fuelAfter.isSenior, true, 'auto-promoted after 2+ months of tenure');
+  assert.strictEqual(fuelAfter.isSeniorManual, false, 'the manual flag itself is never touched by the tenure rule');
+  assert.strictEqual(storeAfter.isSenior, false, 'tenure-based auto-promotion only ever applies to the fuel role');
+});
+
 test('availability: setWeekAvailability replaces (not duplicates) a week\'s picks, listAvailability filters by employee and/or date range', async () => {
   const store = await freshStore();
   const e1 = await store.createEmployee({ name: 'עובד1', roleId: 'fuel', pin: '1111' });
