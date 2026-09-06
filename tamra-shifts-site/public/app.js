@@ -32,7 +32,7 @@ function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-f
 
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
-var CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
+var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
 var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all' };
 
@@ -81,7 +81,7 @@ function login(mode, employeeId, pin) {
 }
 function logout() {
   api('POST', '/api/logout').then(function () {
-    STATE = null; CACHE = { weeks:{}, constraints:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null }; ui.tab = null;
+    STATE = null; CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null }; ui.tab = null;
     api('GET', '/api/public/employees').then(function (pr) { PUBLIC_EMPLOYEES = pr.ok ? pr.data.employees : []; render(); });
   });
 }
@@ -94,9 +94,9 @@ function loadWeek(wk, cb) {
     render();
   });
 }
-function loadConstraints(cb) {
-  var qs = STATE.session.type === 'manager' ? '' : '';
-  api('GET', '/api/constraints' + qs).then(function (r) { if (r.ok) CACHE.constraints = r.data.constraints; if (cb) cb(); render(); });
+function loadAvailability(cb) {
+  var target = nextGenerationWeek();
+  api('GET', '/api/availability?weekStart=' + target).then(function (r) { if (r.ok) CACHE.availability = r.data.availability; if (cb) cb(); render(); });
 }
 function loadSwaps(cb) {
   // fetch full history (not just open) so resolved requests still show who claimed them
@@ -220,14 +220,8 @@ function handleAction(action, el, ev) {
     return;
   }
 
-  if (action === 'add-constraint') { ui.modal = { type: 'constraint-form' }; render(); return; }
-  if (action === 'delete-constraint') {
-    var cid = el.getAttribute('data-id');
-    api('DELETE', '/api/constraints/' + cid).then(function (r) { if (r.ok) { toast('נמחק'); loadConstraints(); } });
-    return;
-  }
-
   if (action === 'request-swap' || action === 'report-noshow') {
+    closeModal();
     var aid2 = el.getAttribute('data-aid');
     var kind = action === 'report-noshow' ? 'noshow' : 'swap';
     api('POST', '/api/assignment/' + aid2 + '/swap-request', { kind: kind }).then(function (r) {
@@ -284,7 +278,7 @@ function handleSubmit(action, form) {
     return;
   }
   if (action === 'submit-employee') {
-    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin'), gender: f.get('gender') || null };
+    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin'), gender: f.get('gender') || null, isSenior: f.get('isSenior') === 'on' };
     var editing = ui.modal && ui.modal.employee;
     var call = editing ? api('PATCH', '/api/employees/' + ui.modal.employee.id, payload) : api('POST', '/api/employees', payload);
     call.then(function (r) {
@@ -293,15 +287,13 @@ function handleSubmit(action, form) {
     });
     return;
   }
-  if (action === 'submit-constraint') {
-    var kind = f.get('kind');
-    var payload2 = { kind: kind, allDay: f.get('allDay') === 'on' };
-    if (kind === 'date') payload2.date = f.get('date'); else payload2.dayOfWeek = Number(f.get('dayOfWeek'));
-    if (!payload2.allDay) { payload2.start = f.get('start'); payload2.end = f.get('end'); }
-    api('POST', '/api/constraints', payload2).then(function (r) {
-      if (r.status === 409) { toast('המועד האחרון להגשת אילוץ לשבוע שמכיל תאריך זה כבר עבר — יש לפנות להנהלה', 'err'); return; }
+  if (action === 'submit-availability') {
+    var target2 = nextGenerationWeek();
+    var days2 = [0, 1, 2, 3, 4, 5, 6].map(function (d) { var ds = addDays(target2, d); return { date: ds, choice: f.get('choice-' + ds) }; });
+    api('POST', '/api/availability', { weekStart: target2, days: days2 }).then(function (r) {
+      if (r.status === 409) { toast('המועד האחרון להגשת הזמינות לשבוע זה כבר עבר — יש לפנות להנהלה', 'err'); return; }
       if (!r.ok) { toast('שגיאה', 'err'); return; }
-      toast('האילוץ נשמר', 'ok'); closeModal(); loadConstraints();
+      toast('הזמינות נשלחה', 'ok'); loadAvailability();
     });
     return;
   }
@@ -366,6 +358,39 @@ document.addEventListener('drop', function (e) {
   if (files && files.length) handleTruthFile(files[0]);
 });
 
+/* ---------- swap-request gesture: long-press or horizontal swipe on a shift ---------- */
+var GESTURE = null;
+var GESTURE_HOLD_MS = 550;
+var GESTURE_MOVE_CANCEL = 12;
+var GESTURE_SWIPE_THRESHOLD = 70;
+function gestureClear() {
+  if (!GESTURE) return;
+  if (GESTURE.timer) clearTimeout(GESTURE.timer);
+  if (GESTURE.el) GESTURE.el.classList.remove('swap-pressing');
+  GESTURE = null;
+}
+function gestureFire(aid) {
+  gestureClear();
+  ui.modal = { type: 'confirm-swap', aid: aid };
+  render();
+}
+document.addEventListener('pointerdown', function (ev) {
+  var el = ev.target.closest && ev.target.closest('[data-swap-aid]');
+  if (!el) return;
+  gestureClear();
+  el.classList.add('swap-pressing');
+  GESTURE = { aid: el.getAttribute('data-swap-aid'), el: el, startX: ev.clientX, startY: ev.clientY };
+  GESTURE.timer = setTimeout(function () { if (GESTURE) gestureFire(GESTURE.aid); }, GESTURE_HOLD_MS);
+});
+document.addEventListener('pointermove', function (ev) {
+  if (!GESTURE) return;
+  var dx = ev.clientX - GESTURE.startX, dy = ev.clientY - GESTURE.startY;
+  if (Math.abs(dx) > GESTURE_SWIPE_THRESHOLD && Math.abs(dx) > Math.abs(dy) * 1.3) { gestureFire(GESTURE.aid); return; }
+  if (GESTURE.timer && (Math.abs(dx) > GESTURE_MOVE_CANCEL || Math.abs(dy) > GESTURE_MOVE_CANCEL)) { clearTimeout(GESTURE.timer); GESTURE.timer = null; }
+});
+document.addEventListener('pointerup', function () { gestureClear(); });
+document.addEventListener('pointercancel', function () { gestureClear(); });
+
 function ensureTabData() {
   if (!STATE) return;
   var tab = ui.tab;
@@ -373,13 +398,13 @@ function ensureTabData() {
   if (tab === 'overview') { if (!CACHE.weeks[weekKeyOf(todayStr())]) loadWeek(weekKeyOf(todayStr())); if (!CACHE.swaps) loadSwaps(); }
   if (tab === 'employees' && !CACHE.employeesFull) loadEmployeesFull();
   if (tab === 'requests' && !CACHE.swaps) loadSwaps();
-  if ((tab === 'requests' || tab === 'myconstraints') && !CACHE.constraints) loadConstraints();
+  if ((tab === 'requests' || tab === 'myavailability') && !CACHE.availability) loadAvailability();
   if ((tab === 'hours' || tab === 'myhours') && !CACHE.hours[ui.currentMonth]) loadHours(ui.currentMonth);
   if ((tab === 'mynotifs' || tab === 'overview' || tab === 'requests') && !CACHE.notifications) loadNotifications();
   if (tab === 'myswaps' && !CACHE.swaps) loadSwaps();
 }
 
-// Other people (an employee claiming a swap, reporting a no-show, submitting a constraint)
+// Other people (an employee claiming a swap, requesting a swap, submitting availability)
 // change shared data server-side without this tab knowing — there's no push/websocket here,
 // so poll quietly in the background while a relevant tab is open. Full-list refreshes only
 // (never while a modal/form is open) so nothing interrupts something the user is mid-typing.
@@ -389,7 +414,7 @@ setInterval(function () {
   var tab = ui.tab;
   if (tab === 'schedule' || tab === 'myschedule') loadWeek(ui.currentWeek);
   if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); loadNotifications(); }
-  if (tab === 'requests') { loadSwaps(); loadConstraints(); loadNotifications(); }
+  if (tab === 'requests') { loadSwaps(); loadAvailability(); loadNotifications(); }
   if (tab === 'myswaps') loadSwaps();
   if (tab === 'mynotifs') loadNotifications();
 }, LIVE_POLL_MS);
@@ -423,7 +448,7 @@ function shellHtml() {
   var isMgr = STATE.session.type === 'manager';
   var tabs = isMgr
     ? [['overview', 'סקירה', '🏠'], ['schedule', 'לוז שבועי', '📅'], ['employees', 'עובדים', '👥'], ['requests', 'בקשות', '📨'], ['hours', 'דוח שעות', '⏱️'], ['settings', 'הגדרות', '⚙️']]
-    : [['myschedule', 'הלוז שלי', '📅'], ['myconstraints', 'האילוצים שלי', '📝'], ['myswaps', 'החלפות', '🔁'], ['myhours', 'השעות שלי', '⏱️'], ['mynotifs', 'התראות', '🔔']];
+    : [['myschedule', 'הלוז שלי', '📅'], ['myavailability', 'הזמינות שלי', '📝'], ['myswaps', 'החלפות', '🔁'], ['myhours', 'השעות שלי', '⏱️'], ['mynotifs', 'התראות', '🔔']];
   ensureTabDataOnce();
   var body;
   if (isMgr) {
@@ -439,7 +464,7 @@ function shellHtml() {
   } else {
     switch (ui.tab) {
       case 'myschedule': body = myScheduleHtml(); break;
-      case 'myconstraints': body = myConstraintsHtml(); break;
+      case 'myavailability': body = myAvailabilityHtml(); break;
       case 'myswaps': body = mySwapsHtml(); break;
       case 'myhours': body = myHoursHtml(); break;
       case 'mynotifs': body = notifsHtml(); break;
@@ -524,6 +549,10 @@ function overviewHtml() {
           var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
           issues.push({ start: t ? timeToMinutes(t.start) : 0, html: '<span class="chip chip-open">בקשת החלפה פתוחה — ' + esc(t ? t.label : '') + '</span>' });
         }
+      });
+      (week.seniorIssues || []).filter(function (u) { return u.date === ds; }).forEach(function (u) {
+        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
+        issues.push({ start: t ? timeToMinutes(t.start) : 0, html: '<span class="chip chip-err">אין מתדלק/ת ותיק/ה — ' + esc(t ? t.label : '') + '</span>' });
       });
       issues.sort(function (a, b) { return a.start - b.start; });
       var chips = issues.map(function (i) { return i.html; });
@@ -635,14 +664,16 @@ function scheduleHtml() {
         var missing = t.needed - assigned.length;
         var manualOnly = t.autoAssign === false; // never auto-filled, never "missing" — just an optional manual add
         var canAddMore = missing > 0 || t.allowExtra; // e.g. store morning: fully staffed still keeps a manual "add one more" option
+        var seniorIssue = t.roleId === 'fuel' && assigned.length > 0 && (week.seniorIssues || []).some(function (si) { return si.date === ds && si.shiftTemplateId === t.id; });
         return '<div class="calevent ' + roleClass(t.roleId) + '">'
           + '<div><span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span></div>'
           + '<div class="cal-time mono">' + t.start + '–' + t.end + '</div>'
           + '<div class="cal-emps">' + assigned.map(function (a) {
               var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
-              return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
+              return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + (emp && emp.isSenior ? ' ⭐' : '') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
             }).join('')
           + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
+          + (seniorIssue ? '<span class="cal-chip understaffed">אין ותיק/ה</span>' : '')
           + '</div>'
           + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
           + '</div>';
@@ -666,7 +697,7 @@ function employeesHtml() {
     + '</div>'
     + '<table><thead><tr><th>שם</th><th>תפקיד</th><th>מגדר</th><th>PIN</th><th>סטטוס</th><th></th></tr></thead><tbody>'
     + list.map(function (e) {
-      return '<tr><td>' + esc(e.name) + '</td><td><span class="pill ' + roleClass(e.roleId) + '">' + esc(roleLabel(e.roleId)) + '</span></td>'
+      return '<tr><td>' + esc(e.name) + (e.isSenior ? ' <span class="pill avail-all" title="מתדלק/ת ותיק/ה">ותיק/ה</span>' : '') + '</td><td><span class="pill ' + roleClass(e.roleId) + '">' + esc(roleLabel(e.roleId)) + '</span></td>'
         + '<td><span class="pill ' + genderClass(e.gender) + '">' + esc(genderLabel(e.gender)) + '</span></td>'
         + '<td class="mono">' + esc(e.pin || '••••') + '</td><td>' + (e.active ? 'פעיל/ה' : 'לא פעיל/ה') + '</td>'
         + '<td><button class="iconbtn" data-action="edit-employee" data-id="' + e.id + '">עריכה</button> <button class="iconbtn" data-action="deactivate-employee" data-id="' + e.id + '">' + (e.active ? 'השבתה' : 'הפעלה') + '</button></td></tr>';
@@ -676,26 +707,47 @@ function employeesHtml() {
 }
 
 /* ---------- requests (manager) ---------- */
-function swapRowHtml(s) {
+function swapRowHtml(s, showCandidates) {
   var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
   var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
   var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
+  var candCol = '';
+  if (showCandidates) {
+    var cands = s.candidates || [];
+    candCol = '<td>' + (cands.length ? cands.map(function (c) { return esc(c.name); }).join(', ') : '<span class="empty" style="padding:0;">אין מועמדים/ות זמינים/ות</span>') + '</td>';
+  }
   return '<tr><td>' + esc(emp ? emp.name : '?') + '</td><td><span class="pill ' + roleClass(s.roleId) + '">' + esc(roleLabel(s.roleId)) + '</span></td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
     + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
     + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
     + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-    + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td></tr>';
+    + '<td>' + (claimer ? esc(claimer.name) : '—') + '</td>' + candCol + '</tr>';
 }
 var SWAP_TABLE_HEAD = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th></tr></thead>';
+var SWAP_TABLE_HEAD_OPEN = '<thead><tr><th>מבקש/ת</th><th>תפקיד</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th>נענתה ע"י</th><th>מועמדים/ות להחלפה</th></tr></thead>';
 
-function constraintRowHtml(c) {
-  var emp = STATE.employees.find(function (e) { return e.id === c.employeeId; });
-  return '<tr><td>' + esc(emp ? emp.name : '?') + '</td>'
-    + '<td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td>'
-    + '<td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td>'
-    + '<td>' + (c.allDay ? 'כל היום' : ('<span class="mono">' + c.start + '–' + c.end + '</span>')) + '</td></tr>';
+/* ---------- requests (manager): availability grid ---------- */
+function availPillHtml(choice) {
+  var labels = { all: 'כל היום', morning: 'בוקר', noon: 'צהריים', night: 'לילה', none: 'לא זמין/ה' };
+  if (!choice) return '<span class="pill" title="לא הוגשה זמינות">—</span>';
+  return '<span class="pill avail-' + choice + '">' + (labels[choice] || choice) + '</span>';
 }
-var CONSTRAINT_TABLE_HEAD = '<thead><tr><th>עובד/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th></tr></thead>';
+function availabilityGridHtml() {
+  var target = nextGenerationWeek();
+  var avail = CACHE.availability || [];
+  var byKey = {};
+  avail.forEach(function (a) { byKey[a.employeeId + '|' + a.date] = a.choice; });
+  var employees = (STATE.employees || []).filter(function (e) { return e.active; });
+  var days = [0, 1, 2, 3, 4, 5, 6].map(function (d) { return addDays(target, d); });
+  var head = '<thead><tr><th>עובד/ת</th>' + days.map(function (ds) {
+    return '<th style="white-space:nowrap;">' + dowName(dowOfDateStr(ds)) + '<br><span class="mono" style="font-weight:400;">' + fmtDateShort(ds) + '</span></th>';
+  }).join('') + '</tr></thead>';
+  var rows = employees.map(function (e) {
+    return '<tr><td>' + esc(e.name) + '</td>' + days.map(function (ds) { return '<td>' + availPillHtml(byKey[e.id + '|' + ds]) + '</td>'; }).join('') + '</tr>';
+  }).join('');
+  return '<div class="card"><div class="card-head"><h2>זמינות שהוגשה לשבוע ' + weekLabel(target) + '</h2></div>'
+    + (employees.length ? ('<table class="xltable">' + head + '<tbody>' + rows + '</tbody></table>') : '<div class="empty">אין עובדים פעילים</div>')
+    + '</div>';
+}
 
 function requestsHtml() {
   var all = CACHE.swaps || [];
@@ -703,25 +755,20 @@ function requestsHtml() {
   var resolved = all.filter(function (s) { return s.status !== 'open'; });
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
-  var constraints = CACHE.constraints || [];
 
   var html = '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
     + (open.length
-        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + open.map(swapRowHtml).join('') + '</tbody></table>')
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD_OPEN + '<tbody>' + open.map(function (s) { return swapRowHtml(s, true); }).join('') + '</tbody></table>')
         : '<div class="empty">אין בקשות פתוחות כרגע — הכול מטופל</div>')
     + '</div>';
 
-  html += '<div class="card"><div class="card-head"><h2>היסטוריית בקשות</h2></div>'
+  html += '<div class="card"><div class="card-head"><h2>בקשות סגורות</h2></div>'
     + (resolved.length
-        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(swapRowHtml).join('') + '</tbody></table>')
+        ? ('<table class="xltable">' + SWAP_TABLE_HEAD + '<tbody>' + resolved.map(function (s) { return swapRowHtml(s, false); }).join('') + '</tbody></table>')
         : '<div class="empty">אין עדיין היסטוריה</div>')
     + '</div>';
 
-  html += '<div class="card"><div class="card-head"><h2>אילוצים וימי חופש שהוגשו' + (constraints.length ? ' — ' + constraints.length : '') + '</h2></div>'
-    + (constraints.length
-        ? ('<table class="xltable">' + CONSTRAINT_TABLE_HEAD + '<tbody>' + constraints.map(constraintRowHtml).join('') + '</tbody></table>')
-        : '<div class="empty">לא הוגשו אילוצים עדיין</div>')
-    + '</div>';
+  html += availabilityGridHtml();
 
   html += '<div class="card"><div class="card-head"><h2>יומן התראות' + (unread ? ' — ' + unread + ' חדשות' : '') + '</h2></div>' + notifListHtml(notifs) + '</div>';
   return html;
@@ -832,12 +879,12 @@ function myScheduleHtml() {
       body = dayAssignments.map(function (a) {
         var t = STATE.shiftTemplates.find(function (tt) { return tt.id === a.shiftTemplateId; });
         var openReq = swaps.find(function (s) { return s.assignmentId === a.id && s.status === 'open'; });
-        return '<div class="calevent ' + roleClass(t ? t.roleId : '') + '">'
+        return '<div class="calevent ' + roleClass(t ? t.roleId : '') + '"' + (openReq ? '' : (' data-swap-aid="' + a.id + '"')) + '>'
           + '<div><span class="pill ' + roleClass(t ? t.roleId : '') + '">' + esc(t ? t.label : '') + '</span></div>'
           + '<div class="cal-time mono">' + (t ? t.start + '–' + t.end : '') + '</div>'
-          + '<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">' + (openReq
+          + '<div style="margin-top:8px;">' + (openReq
               ? '<span class="pill status-open">בקשה פתוחה</span>'
-              : ('<button class="btn secondary sm" data-action="request-swap" data-aid="' + a.id + '">בקש/י החלפה</button><button class="btn sm danger" data-action="report-noshow" data-aid="' + a.id + '">לא אוכל/ה להגיע</button>'))
+              : '<div class="swap-hint">החזק/י לחיצה או גלול/י בצדדים לבקשת החלפה</div>')
           + '</div></div>';
       }).join('');
     }
@@ -846,38 +893,63 @@ function myScheduleHtml() {
   return html;
 }
 
-/* ---------- employee: my constraints ---------- */
-function myConstraintsHtml() {
-  var list = CACHE.constraints || [];
+/* ---------- employee: my availability ---------- */
+var AVAILABILITY_CHOICES = [['all', 'כל היום'], ['morning', 'בוקר'], ['noon', 'צהריים'], ['night', 'לילה'], ['none', 'לא יכול/ה']];
+function myAvailabilityHtml() {
   var target = nextGenerationWeek();
   var deadline = deadlineForWeek(target, STATE.settings.weeklyGenerationDow);
-  return '<div class="card"><div class="card-head"><h2>האילוצים שלי</h2><button class="btn" data-action="add-constraint">+ הוספת אילוץ</button></div>'
-    + '<div class="helpcard">אילוצים לשבוע ' + weekLabel(target) + ' ניתן להגיש עד יום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59. לאחר מכן יש לפנות להנהלה לעדכון ידני.</div>'
-    + (list.length ? ('<table class="xltable"><thead><tr><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>שעות</th><th></th></tr></thead><tbody>' + list.map(function (c) {
-        return '<tr><td>' + (c.kind === 'date' ? 'תאריך' : 'קבוע') + '</td><td style="white-space:nowrap;">' + (c.kind === 'date' ? dayDateHtml(c.date) : ('<b>' + dowName(c.dayOfWeek) + '</b> (כל שבוע)')) + '</td><td>' + (c.allDay ? 'כל היום' : ('<span class="mono">' + c.start + '–' + c.end + '</span>')) + '</td><td><button class="iconbtn" data-action="delete-constraint" data-id="' + c.id + '">מחיקה</button></td></tr>';
-      }).join('') + '</tbody></table>') : '<div class="empty">לא הוגשו אילוצים</div>')
-    + '</div>';
+  var list = CACHE.availability || [];
+  var byDate = {};
+  list.forEach(function (a) { if (a.employeeId === STATE.me.id) byDate[a.date] = a.choice; });
+  var days = [0, 1, 2, 3, 4, 5, 6].map(function (d) { return addDays(target, d); });
+  var rows = days.map(function (ds) {
+    var cur = byDate[ds] || '';
+    return '<tr><td style="white-space:nowrap;">' + dayDateHtml(ds) + '</td><td>'
+      + '<select name="choice-' + ds + '" required>'
+      + '<option value=""' + (cur ? '' : ' selected') + ' disabled>יש לבחור זמינות</option>'
+      + AVAILABILITY_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (cur === c[0] ? ' selected' : '') + '>' + c[1] + '</option>'; }).join('')
+      + '</select></td></tr>';
+  }).join('');
+  return '<div class="card"><div class="card-head"><h2>הזמינות שלי</h2></div>'
+    + '<div class="helpcard">יש לסמן זמינות לכל יום בשבוע ' + weekLabel(target) + ' ולשלוח בסוף — עד יום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59. לאחר מכן יש לפנות להנהלה לעדכון ידני.</div>'
+    + '<form data-action="submit-availability">'
+    + '<table class="xltable"><thead><tr><th>יום ותאריך</th><th>זמינות</th></tr></thead><tbody>' + rows + '</tbody></table>'
+    + '<button class="btn" type="submit" style="margin-top:12px;">שליחת זמינות</button>'
+    + '</form></div>';
 }
 
 /* ---------- employee: my swaps ---------- */
+function mySwapRowHtml(s, showCandidates) {
+  var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
+  var isMine = s.requesterId === STATE.me.id;
+  var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
+  var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
+  var lastCol = '';
+  if (!isMine && s.status === 'open') lastCol = '<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>';
+  else if (isMine && s.status === 'open') lastCol = '<button class="btn sm danger" data-action="cancel-swap" data-id="' + s.id + '">ביטול בקשה</button>';
+  else if (claimer) lastCol = 'נלקח ע"י ' + esc(claimer.name);
+  var candCol = '';
+  if (showCandidates) {
+    var cands = s.candidates || [];
+    candCol = '<td>' + (cands.length ? cands.map(function (c) { return esc(c.name); }).join(', ') : '<span class="empty" style="padding:0;">אין מועמדים/ות זמינים/ות</span>') + '</td>';
+  }
+  return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
+    + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
+    + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
+    + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
+    + '<td>' + lastCol + '</td>' + candCol + '</tr>';
+}
 function mySwapsHtml() {
   var swaps = (CACHE.swaps || []).filter(function (s) { return s.requesterId === STATE.me.id || s.roleId === STATE.me.roleId; });
-  return '<div class="card"><div class="card-head"><h2>החלפות</h2></div>'
-    + (swaps.length ? ('<table class="xltable"><thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th></tr></thead><tbody>' + swaps.map(function (s) {
-        var emp = STATE.employees.find(function (e) { return e.id === s.requesterId; });
-        var isMine = s.requesterId === STATE.me.id;
-        var t = STATE.shiftTemplates.find(function (tt) { return tt.id === s.shiftTemplateId; });
-        var claimer = s.claimedBy ? STATE.employees.find(function (e) { return e.id === s.claimedBy; }) : null;
-        var lastCol = '';
-        if (!isMine && s.status === 'open') lastCol = '<button class="btn sm" data-action="claim-swap" data-id="' + s.id + '">אני אקח/קח</button>';
-        else if (isMine && s.status === 'open') lastCol = '<button class="btn sm danger" data-action="cancel-swap" data-id="' + s.id + '">ביטול בקשה</button>';
-        else if (claimer) lastCol = 'נלקח ע"י ' + esc(claimer.name);
-        return '<tr><td>' + esc(isMine ? 'אני' : (emp ? emp.name : '?')) + '</td><td>' + (s.kind === 'noshow' ? 'לא יכול/ה להגיע' : 'בקשת החלפה') + '</td>'
-          + '<td style="white-space:nowrap;">' + dayDateHtml(s.date) + '</td>'
-          + '<td>' + (t ? ('<span class="pill ' + roleClass(t.roleId) + '">' + esc(t.label) + '</span> <span class="mono">' + t.start + '–' + t.end + '</span>') : '—') + '</td>'
-          + '<td><span class="pill status-' + s.status + '">' + (s.status === 'open' ? 'פתוח' : 'נענה') + '</span></td>'
-          + '<td>' + lastCol + '</td></tr>';
-      }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות רלוונטיות כרגע</div>')
+  var open = swaps.filter(function (s) { return s.status === 'open'; });
+  var closed = swaps.filter(function (s) { return s.status !== 'open'; });
+  var openHead = '<thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th><th>מועמדים/ות להחלפה</th></tr></thead>';
+  var closedHead = '<thead><tr><th>מבקש/ת</th><th>סוג</th><th style="white-space:nowrap;">יום ותאריך</th><th>משמרת</th><th>סטטוס</th><th></th></tr></thead>';
+  return '<div class="card"><div class="card-head"><h2>בקשות פתוחות' + (open.length ? ' — ' + open.length : '') + '</h2></div>'
+    + (open.length ? ('<table class="xltable">' + openHead + '<tbody>' + open.map(function (s) { return mySwapRowHtml(s, true); }).join('') + '</tbody></table>') : '<div class="empty">אין בקשות פתוחות כרגע</div>')
+    + '</div>'
+    + '<div class="card"><div class="card-head"><h2>בקשות סגורות</h2></div>'
+    + (closed.length ? ('<table class="xltable">' + closedHead + '<tbody>' + closed.map(function (s) { return mySwapRowHtml(s, false); }).join('') + '</tbody></table>') : '<div class="empty">אין עדיין היסטוריה</div>')
     + '</div>';
 }
 
@@ -919,17 +991,16 @@ function modalHtml() {
         + (e && e.roleId === 'office' ? '<option value="office" selected>פקיד/ה (תפקיד שהוסר — אפשר לבחור תפקיד אחר)</option>' : '') + '</select></div>'
       + '<div class="field"><label>קוד PIN אישי</label><input name="pin" pattern="[0-9]{4,6}" required value="' + (e ? esc(e.pin||'') : '') + '"></div>'
       + '<div class="field"><label>מגדר</label><select name="gender" required><option value="">בחר/י</option><option value="male"' + (e && e.gender==='male'?' selected':'') + '>זכר</option><option value="female"' + (e && e.gender==='female'?' selected':'') + '>נקבה</option></select></div>'
+      + '<div class="field"><label><input type="checkbox" name="isSenior" style="width:auto;display:inline-block;"' + (e && e.isSenior ? ' checked' : '') + '> מתדלק/ת ותיק/ה <span style="font-weight:400;color:var(--text-dim);">(רלוונטי למתדלקים בלבד — בכל משמרת מתדלקים חייב להיות משובץ לפחות מתדלק/ת ותיק/ה אחד/ת)</span></label></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
-  } else if (m.type === 'constraint-form') {
-    inner = '<h3>הוספת אילוץ</h3><form data-action="submit-constraint">'
-      + '<div class="field"><label>סוג</label><select name="kind" id="constraint-kind-select" onchange="document.getElementById(\'ck-date\').style.display=this.value===\'date\'?\'\':\'none\';document.getElementById(\'ck-dow\').style.display=this.value===\'recurring\'?\'\':\'none\';"><option value="date">תאריך ספציפי</option><option value="recurring">יום קבוע בשבוע</option></select></div>'
-      + '<div class="field" id="ck-date"><label>תאריך</label><input type="date" name="date" value="' + todayStr() + '"></div>'
-      + '<div class="field" id="ck-dow" style="display:none"><label>יום בשבוע</label><select name="dayOfWeek">' + [0,1,2,3,4,5,6].map(function(d){return '<option value="'+d+'">'+dowName(d)+'</option>';}).join('') + '</select></div>'
-      + '<div class="field"><label><input type="checkbox" name="allDay" style="width:auto;display:inline-block;"> כל היום</label></div>'
-      + '<div class="field-row"><div class="field"><label>משעה</label><input type="time" name="start" value="08:00"></div><div class="field"><label>עד שעה</label><input type="time" name="end" value="16:00"></div></div>'
-      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
-      + '</form>';
+  } else if (m.type === 'confirm-swap') {
+    var aidC = m.aid;
+    var weekObjC = CACHE.weeks[ui.currentWeek];
+    var aObjC = weekObjC && weekObjC.assignments.find(function (x) { return x.id === aidC; });
+    var tC = aObjC ? STATE.shiftTemplates.find(function (tt) { return tt.id === aObjC.shiftTemplateId; }) : null;
+    inner = '<h3>בקשת החלפה</h3><p>לשלוח בקשת החלפה למשמרת' + (tC ? (' <b>' + esc(tC.label) + '</b>, ' + dayDateHtml(aObjC.date)) : '') + '?</p>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" data-action="request-swap" data-aid="' + aidC + '">שליחת בקשה</button></div>';
   }
   return '<div class="modal-bg" data-action="close-modal"><div class="modal">' + inner + '</div></div>';
 }
