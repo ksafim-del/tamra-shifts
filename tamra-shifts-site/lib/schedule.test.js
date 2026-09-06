@@ -39,6 +39,30 @@ test('isAvailableForShift: "all" covers every bucket, "none" covers nothing, a s
   assert.strictEqual(S.isAvailableForShift(undefined, 'morning'), false, 'an explicit missing/falsy choice is treated as unavailable by this pure function — callers default a truly-unsubmitted day to \'all\' themselves');
 });
 
+test('seniorEligibleByTenure: false before two months, true at and after exactly two months', () => {
+  const hired = new Date(2026, 0, 15).getTime(); // 15.01.2026
+  const oneMonthLater = new Date(2026, 1, 15).getTime();
+  const almostTwoMonths = new Date(2026, 2, 14).getTime();
+  const exactlyTwoMonths = new Date(2026, 2, 15).getTime();
+  const wellPast = new Date(2026, 5, 1).getTime();
+  assert.strictEqual(S.seniorEligibleByTenure(hired, oneMonthLater), false);
+  assert.strictEqual(S.seniorEligibleByTenure(hired, almostTwoMonths), false);
+  assert.strictEqual(S.seniorEligibleByTenure(hired, exactlyTwoMonths), true);
+  assert.strictEqual(S.seniorEligibleByTenure(hired, wellPast), true);
+  assert.strictEqual(S.seniorEligibleByTenure(null, wellPast), false, 'no createdAt at all is never tenure-eligible');
+});
+
+test('isEffectivelySenior: a manual flag always wins; tenure-based auto-promotion only ever applies to the fuel role', () => {
+  const now = new Date(2026, 5, 1).getTime();
+  const longAgo = new Date(2025, 0, 1).getTime();
+  const recent = new Date(2026, 4, 20).getTime();
+  assert.strictEqual(S.isEffectivelySenior({ isSeniorManual: true, roleId: 'store', createdAt: recent }, now), true, 'a manual flag makes anyone senior regardless of role or tenure');
+  assert.strictEqual(S.isEffectivelySenior({ isSeniorManual: false, roleId: 'fuel', createdAt: longAgo }, now), true, 'a fuel attendant employed well over two months is auto-senior');
+  assert.strictEqual(S.isEffectivelySenior({ isSeniorManual: false, roleId: 'fuel', createdAt: recent }, now), false, 'a fuel attendant employed under two months is not yet senior');
+  assert.strictEqual(S.isEffectivelySenior({ isSeniorManual: false, roleId: 'store', createdAt: longAgo }, now), false, 'tenure alone never promotes a non-fuel employee');
+  assert.strictEqual(S.isEffectivelySenior(null, now), false);
+});
+
 test('durationHours handles overnight shifts', () => {
   assert.strictEqual(S.durationHours('21:00', '05:00'), 8);
   assert.strictEqual(S.durationHours('05:00', '13:00'), 8);
