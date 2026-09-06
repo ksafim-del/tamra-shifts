@@ -10,8 +10,10 @@ async function generateWeek(store, weekStart, { force } = {}) {
   if (existing && !force) {
     return { skipped: true, reason: 'already_generated', week: existing };
   }
-  const [employees, shiftTemplates, constraints, meta] = await Promise.all([
-    store.listEmployees(), store.listShiftTemplates(), store.listConstraints(), store.getSettings(),
+  const [employees, shiftTemplates, availability, meta] = await Promise.all([
+    store.listEmployees(), store.listShiftTemplates(),
+    store.listAvailability({ fromDate: weekStart, toDate: S.addDays(weekStart, 6) }),
+    store.getSettings(),
   ]);
   const priorWeekStart = S.addWeeks(weekStart, -1);
   const priorWeek = await store.getScheduleWeek(priorWeekStart);
@@ -20,12 +22,20 @@ async function generateWeek(store, weekStart, { force } = {}) {
   const priorAssignments = (priorWeek ? priorWeek.assignments : []).map(a =>
     Object.assign({}, a, { _startTs: S.shiftStartTs(a, templatesById) }));
 
-  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, constraints, meta, priorAssignments });
+  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, availability, meta, priorAssignments });
   await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt);
 
   // A regeneration of the same week (manual "הפק מחדש", or the automatic Thursday run) replaces
   // this week's status notification instead of piling another one on top of the last.
   await store.replaceScheduleStatusNotification(weekStart);
+
+  if (result.seniorIssues.length) {
+    await store.addNotification({
+      audience: 'manager', type: 'no-senior-fuel', relatedId: weekStart,
+      text: 'הלוז לשבוע ' + weekStart + ' — ' + result.seniorIssues.length + ' משמרות מתדלקים מאוישות ללא אף מתדלק/ת ותיק/ה. לפירוט: לשונית "לוז שבועי".',
+      severity: 'warning', channels: ['inapp'],
+    });
+  }
 
   if (result.understaffed.length) {
     // A short, organized summary rather than one line per missing slot — the full breakdown
