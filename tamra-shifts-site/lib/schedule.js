@@ -133,6 +133,26 @@ function isAvailableForShift(choice, bucket) {
   return choice === bucket;
 }
 
+/* ---------- senior fuel attendant ("מתדלק/ת ותיק/ה") tenure auto-promotion ----------
+ * A fuel attendant automatically becomes "senior" once they've been registered in the system
+ * for more than two months, regardless of the manual isSenior flag. isEffectivelySenior()
+ * combines the manual flag with this tenure rule; it is the single source of truth used both
+ * for schedule generation and for anything displaying the badge.
+ */
+const SENIOR_TENURE_MONTHS = 2;
+function seniorEligibleByTenure(createdAt, now) {
+  if (!createdAt) return false;
+  const d = new Date(createdAt);
+  d.setMonth(d.getMonth() + SENIOR_TENURE_MONTHS);
+  return (now == null ? Date.now() : now) >= d.getTime();
+}
+function isEffectivelySenior(employee, now) {
+  if (!employee) return false;
+  if (employee.isSeniorManual) return true;
+  if (employee.roleId !== 'fuel') return false;
+  return seniorEligibleByTenure(employee.createdAt, now);
+}
+
 /* ---------- scheduling constraints (legacy — kept for backward compatibility with any
  * still-stored data and the pure deadline helper below, but no longer used by generateSchedule,
  * which now runs on the availability model above) ---------- */
@@ -301,5 +321,6 @@ module.exports = {
   constraintDeadlinePassed, seededRandom, shiftStartTs, shiftEndTs,
   isInShabbat, isInNightWindow, isBlocked, hasRestConflict,
   timeBucketOf, isAvailableForShift,
+  SENIOR_TENURE_MONTHS, seniorEligibleByTenure, isEffectivelySenior,
   generateSchedule, computeMonthlyHours,
 };
