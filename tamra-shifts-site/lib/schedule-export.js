@@ -1,109 +1,100 @@
 'use strict';
-// Builds the "export to Excel" workbook for one generated week — one sheet per role (fuel/store),
-// laid out like a weekly calendar: a row per day (Sunday..Saturday), a column per shift, so a
-// manager can see the whole week at a glance instead of scrolling a long flat list. Pure data-
-// shaping only; the actual .xlsx bytes come from xlsx-writer.js.
-const S = require('./schedule.js');
-const { STYLES } = require('./xlsx-writer.js');
+const assert = require('node:assert');
+const test = require('node:test');
+const { buildScheduleSheets, weekRangeLabel, fmtDateDDMMYYYY } = require('./schedule-export.js');
 
-const DOW_NAMES_HE = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
-const ROLE_LABELS = { fuel: 'מתדלקים', store: 'עובדי חנות' };
-const UNFILLED = '— חסר איוש —';
-const NOT_RUNNING = '–';
+const TEMPLATES = [
+  { id: 't-fuel-morning', roleId: 'fuel', label: 'בוקר מתדלקים', start: '06:00', end: '14:00', needed: 1, days: [0, 1, 2, 3, 4, 5, 6], active: true },
+  { id: 't-fuel-night', roleId: 'fuel', label: 'לילה מתדלקים', start: '22:00', end: '06:00', needed: 1, days: [0, 1, 2, 3, 4, 5], active: true }, // no night shift on Saturday
+  { id: 't-store-morning', roleId: 'store', label: 'בוקר חנות', start: '06:00', end: '13:00', needed: 1, days: [0, 1, 2, 3, 4, 5, 6], active: true },
+  { id: 't-inactive', roleId: 'fuel', label: 'לא פעיל', start: '01:00', end: '02:00', needed: 1, days: [0], active: false },
+];
 
-function fmtDateDDMMYYYY(dateStr) {
-  const [y, m, d] = dateStr.split('-');
-  return d + '.' + m + '.' + y;
-}
+const EMPLOYEES = [
+  { id: 'e1', name: 'דני כהן' },
+  { id: 'e2', name: 'אבי לוי' },
+];
 
-function weekRangeLabel(weekStart) {
-  return fmtDateDDMMYYYY(weekStart) + '–' + fmtDateDDMMYYYY(S.addDays(weekStart, 6));
-}
+const UNFILLED_PLACEHOLDER = '— חסר איוש —';
+const NOT_RUNNING_PLACEHOLDER = '–';
 
-/**
- * @param {string} weekStart
- * @param {Array} templates shift templates (rowToTemplate shape: id, roleId, label, start, end, needed, days, active)
- * @param {Array} employees (id, name, roleId, active, ...)
- * @param {Array} assignments this week's assignments (date, shiftTemplateId, employeeId)
- * @param {string} companyName
- * @returns {Array<{name: string, rows: Array, colWidths: number[]}>} sheets, ready for xlsx-writer's buildWorkbook
- */
-function buildScheduleSheets(weekStart, templates, employees, assignments, companyName) {
-  const employeesById = {};
-  employees.forEach((e) => { employeesById[e.id] = e; });
-  const rangeLabel = weekRangeLabel(weekStart);
+test('fmtDateDDMMYYYY / weekRangeLabel format dates as d.m.yyyy', () => {
+  assert.strictEqual(fmtDateDDMMYYYY('2026-08-30'), '30.08.2026');
+  assert.strictEqual(weekRangeLabel('2026-08-30'), '30.08.2026–05.09.2026');
+});
 
-  return ['fuel', 'store'].map((roleId) => {
-    const roleTemplates = templates
-      .filter((t) => t.active && t.roleId === roleId)
-      .slice()
-      .sort((a, b) => S.timeToMinutes(a.start) - S.timeToMinutes(b.start));
-    const totalCols = 2 + roleTemplates.length;
+test('buildScheduleSheets produces one calendar-style sheet per role: a row per day, a column per shift', () => {
+  const assignments = [
+    { date: '2026-08-30', shiftTemplateId: 't-fuel-morning', employeeId: 'e1' },
+  ];
+  const sheets = buildScheduleSheets('2026-08-30', TEMPLATES, EMPLOYEES, assignments, 'תמרה דלקים (96) בע"מ');
 
-    const titleRow = [(companyName || 'תמרה') + ' — לוז שבועי — ' + ROLE_LABELS[roleId] + ' — שבוע ' + rangeLabel];
-    const headerRow = ['יום', 'תאריך'].concat(roleTemplates.map((t) => t.label + '\n' + t.start + '–' + t.end));
+  assert.strictEqual(sheets.length, 2);
+  assert.strictEqual(sheets[0].name, 'מתדלקים');
+  assert.strictEqual(sheets[1].name, 'עובדי חנות');
+  // fuel sheet: יום + תאריך + 2 shift columns (inactive template excluded)
+  assert.deepStrictEqual(sheets[0].colWidths, [10, 12, 24, 24]);
 
-    const dayRows = [];
-    const dayStyles = [];
-    for (let d = 0; d < 7; d++) {
-      const ds = S.addDays(weekStart, d);
-      const dow = S.dowOf(ds);
-      const row = [DOW_NAMES_HE[dow], fmtDateDDMMYYYY(ds)];
-      const styleRow = [STYLES.daylabel, STYLES.daylabel];
-      roleTemplates.forEach((t) => {
-        if (t.days.indexOf(dow) === -1) {
-          row.push(NOT_RUNNING); // this shift doesn't run on this day at all
-          styleRow.push(STYLES.missing);
-          return;
-        }
-        const assigned = assignments.filter((a) => a.date === ds && a.shiftTemplateId === t.id);
-        if (!assigned.length) {
-          row.push(UNFILLED);
-          styleRow.push(STYLES.missing);
-          return;
-        }
-        const names = assigned
-          .map((a) => (employeesById[a.employeeId] ? employeesById[a.employeeId].name : '?'))
-          .sort((a, b) => a.localeCompare(b, 'he'));
-        row.push(names.join(', '));
-        styleRow.push(STYLES.data);
-      });
-      dayRows.push(row);
-      dayStyles.push(styleRow);
-    }
+  // row 0 = title (merged conceptually into col A), row 1 = header, rows 2-8 = the 7 days
+  assert.ok(sheets[0].rows[0][0].includes('תמרה דלקים'));
+  assert.ok(sheets[0].rows[0][0].includes('מתדלקים'));
+  assert.deepStrictEqual(sheets[0].rows[1], ['יום', 'תאריך', 'בוקר מתדלקים\n06:00–14:00', 'לילה מתדלקים\n22:00–06:00']);
+  assert.strictEqual(sheets[0].rows.length, 2 + 7, 'title + header + one row per day of the week');
 
-    const rows = [titleRow, headerRow, ...dayRows];
-    const styles = [
-      [STYLES.title],
-      headerRow.map(() => STYLES.header),
-      ...dayStyles,
-    ];
-    const rowHeights = [22, 34, ...dayRows.map(() => 32)];
-    const lastCol = colLettersLocal(totalCols - 1);
+  // Sunday 30.08: morning is assigned to דני כהן, night is unfilled
+  const sunday = sheets[0].rows[2];
+  assert.deepStrictEqual(sunday, ['ראשון', '30.08.2026', 'דני כהן', UNFILLED_PLACEHOLDER]);
 
-    return {
-      name: ROLE_LABELS[roleId],
-      rows: rows,
-      colWidths: [10, 12].concat(roleTemplates.map(() => 24)),
-      styles: styles,
-      rowHeights: rowHeights,
-      merges: ['A1:' + lastCol + '1'],
-      freeze: { x: 2, y: 2 },
-    };
-  });
-}
+  // Saturday: fuel-night template doesn't run (day 6 not in its `days` list) -> a plain dash, not the "unfilled" placeholder
+  const saturday = sheets[0].rows[8];
+  assert.strictEqual(saturday[0], 'שבת');
+  assert.strictEqual(saturday[3], NOT_RUNNING_PLACEHOLDER, 'a shift that does not run on this day should render as a plain dash, not the unfilled placeholder');
 
-// Local copy of the 0-based-column -> letters conversion (kept tiny and dependency-free rather
-// than reaching into xlsx-writer's internals for one helper).
-function colLettersLocal(n) {
-  let s = '';
-  n += 1;
-  while (n > 0) {
-    const rem = (n - 1) % 26;
-    s = String.fromCharCode(65 + rem) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
-}
+  // inactive template must not produce a column at all
+  assert.strictEqual(sheets[0].rows[1].length, 4);
 
-module.exports = { buildScheduleSheets, weekRangeLabel, fmtDateDDMMYYYY };
+  // store sheet still lists its own unfilled shift as a placeholder cell
+  const storeSunday = sheets[1].rows[2];
+  assert.deepStrictEqual(storeSunday, ['ראשון', '30.08.2026', UNFILLED_PLACEHOLDER]);
+});
+
+test('buildScheduleSheets attaches styling metadata (title merge, frozen header, per-cell styles, row heights) for a clean-looking export', () => {
+  const { STYLES } = require('./xlsx-writer.js');
+  const assignments = [
+    { date: '2026-08-30', shiftTemplateId: 't-fuel-morning', employeeId: 'e1' },
+  ];
+  const sheets = buildScheduleSheets('2026-08-30', TEMPLATES, EMPLOYEES, assignments, 'תמרה');
+  const fuelSheet = sheets[0];
+
+  // title row merged across every data column, so it reads as one banner instead of a lone A1 cell
+  assert.deepStrictEqual(fuelSheet.merges, ['A1:D1']);
+  // day/date columns + header row frozen so they stay in view while scrolling a busy week
+  assert.deepStrictEqual(fuelSheet.freeze, { x: 2, y: 2 });
+  // one style id per cell, same shape as `rows`
+  assert.strictEqual(fuelSheet.styles.length, fuelSheet.rows.length);
+  assert.strictEqual(fuelSheet.styles[0][0], STYLES.title);
+  assert.deepStrictEqual(fuelSheet.styles[1], fuelSheet.rows[1].map(() => STYLES.header));
+  assert.deepStrictEqual(fuelSheet.styles[2].slice(0, 2), [STYLES.daylabel, STYLES.daylabel]);
+  assert.strictEqual(fuelSheet.styles[2][2], STYLES.data, 'a filled shift cell uses the data style');
+  assert.strictEqual(fuelSheet.styles[2][3], STYLES.missing, 'an unfilled shift cell uses the missing style');
+  // taller rows than a default so wrapped multi-name cells and the two-line header stay readable
+  assert.ok(fuelSheet.rowHeights.every((h) => h >= 22));
+});
+
+test('buildScheduleSheets joins multiple employees on the same shift/day with a comma, sorted by Hebrew name, and falls back to "?" for an unknown employee id', () => {
+  const assignments = [
+    { date: '2026-08-30', shiftTemplateId: 't-fuel-morning', employeeId: 'e2' }, // אבי לוי
+    { date: '2026-08-30', shiftTemplateId: 't-fuel-morning', employeeId: 'e1' }, // דני כהן
+    { date: '2026-08-30', shiftTemplateId: 't-fuel-morning', employeeId: 'ghost' }, // no matching employee
+  ];
+  const sheets = buildScheduleSheets('2026-08-30', TEMPLATES, EMPLOYEES, assignments, 'תמרה');
+  const cell = sheets[0].rows[2][2]; // Sunday, "בוקר מתדלקים" column
+  // '?' sorts before Hebrew letters under the 'he' locale collator; the two real names keep their
+  // Hebrew-alphabetical order relative to each other.
+  assert.strictEqual(cell, '?, אבי לוי, דני כהן');
+});
+
+test('buildScheduleSheets falls back to "תמרה" when companyName is missing', () => {
+  const sheets = buildScheduleSheets('2026-08-30', TEMPLATES, EMPLOYEES, [], undefined);
+  assert.ok(sheets[0].rows[0][0].startsWith('תמרה —'));
+});
