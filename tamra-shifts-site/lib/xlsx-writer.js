@@ -112,39 +112,111 @@ function colLetters(n) {
   return s;
 }
 
-function buildSheetXml(rows, colWidths) {
+// Predefined cell formats (indices into the fixed cellXfs list built in buildStylesXml below).
+// Callers reference these by name via the STYLES export instead of poking at raw xf indices.
+const STYLES = { plain: 0, title: 1, header: 2, daylabel: 3, data: 4, missing: 5 };
+
+function buildSheetXml(rows, colWidths, opts) {
+  opts = opts || {};
+  const styles = opts.styles || [];
+  const rowHeights = opts.rowHeights || [];
   let rowsXml = '';
   rows.forEach((row, r) => {
     const rNum = r + 1;
+    const styleRow = styles[r] || [];
     let cellsXml = '';
     row.forEach((val, c) => {
       const ref = colLetters(c) + rNum;
+      const sId = styleRow[c] || 0;
+      const sAttr = sId ? (' s="' + sId + '"') : '';
       if (val == null || val === '') {
-        cellsXml += '<c r="' + ref + '"/>';
+        cellsXml += '<c r="' + ref + '"' + sAttr + '/>';
       } else if (typeof val === 'number' && isFinite(val)) {
-        cellsXml += '<c r="' + ref + '"><v>' + val + '</v></c>';
+        cellsXml += '<c r="' + ref + '"' + sAttr + '><v>' + val + '</v></c>';
       } else {
-        cellsXml += '<c r="' + ref + '" t="inlineStr"><is><t xml:space="preserve">' + xmlEscape(val) + '</t></is></c>';
+        cellsXml += '<c r="' + ref + '"' + sAttr + ' t="inlineStr"><is><t xml:space="preserve">' + xmlEscape(val) + '</t></is></c>';
       }
     });
-    rowsXml += '<row r="' + rNum + '">' + cellsXml + '</row>';
+    const h = rowHeights[r];
+    const hAttr = h ? (' ht="' + h + '" customHeight="1"') : '';
+    rowsXml += '<row r="' + rNum + '"' + hAttr + '>' + cellsXml + '</row>';
   });
   const colsXml = colWidths && colWidths.length
     ? '<cols>' + colWidths.map((w, i) => '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + w + '" customWidth="1"/>').join('') + '</cols>'
     : '';
+  // Freeze panes so the header row (and the day/date columns) stay in view while scrolling
+  // through the week — especially useful on a phone screen, where only a couple of shift
+  // columns fit at once. opts.freeze = { x: <cols to freeze from the right>, y: <rows to freeze from the top> }.
+  const freeze = opts.freeze;
+  let sheetView;
+  if (freeze && (freeze.x || freeze.y)) {
+    const topLeft = colLetters(freeze.x || 0) + ((freeze.y || 0) + 1);
+    sheetView = '<sheetView rightToLeft="1" workbookViewId="0">'
+      + '<pane xSplit="' + (freeze.x || 0) + '" ySplit="' + (freeze.y || 0) + '" topLeftCell="' + topLeft + '" activePane="bottomRight" state="frozen"/>'
+      + '</sheetView>';
+  } else {
+    sheetView = '<sheetView rightToLeft="1" workbookViewId="0"/>';
+  }
+  const mergesXml = opts.merges && opts.merges.length
+    ? '<mergeCells count="' + opts.merges.length + '">' + opts.merges.map((m) => '<mergeCell ref="' + m + '"/>').join('') + '</mergeCells>'
+    : '';
   return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-    + '<sheetViews><sheetView rightToLeft="1" workbookViewId="0"/></sheetViews>'
+    + '<sheetViews>' + sheetView + '</sheetViews>'
     + colsXml
     + '<sheetData>' + rowsXml + '</sheetData>'
+    + mergesXml
     + '</worksheet>';
+}
+
+// styles.xml: a small fixed palette (title / header / day-label / data / missing-slot) shared by
+// every sheet in the workbook, referenced by cells via their "s" (style index) attribute — see
+// STYLES above. Kept intentionally minimal (bold + light fills + thin borders + wrap text) rather
+// than trying to reproduce full theming, since the goal is just a clean, readable grid.
+function buildStylesXml() {
+  const fonts = [
+    '<font><sz val="11"/><name val="Calibri"/></font>',
+    '<font><b/><sz val="11"/><name val="Calibri"/></font>',
+    '<font><b/><sz val="14"/><name val="Calibri"/></font>',
+    '<font><i/><sz val="11"/><color rgb="FF8A8072"/><name val="Calibri"/></font>',
+  ];
+  const fills = [
+    '<fill><patternFill patternType="none"/></fill>',
+    '<fill><patternFill patternType="gray125"/></fill>',
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFBE4CC"/><bgColor indexed="64"/></patternFill></fill>',
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFF3EDE2"/><bgColor indexed="64"/></patternFill></fill>',
+  ];
+  const thin = '<left style="thin"><color rgb="FFE4D9C8"/></left><right style="thin"><color rgb="FFE4D9C8"/></right><top style="thin"><color rgb="FFE4D9C8"/></top><bottom style="thin"><color rgb="FFE4D9C8"/></bottom><diagonal/>';
+  const borders = [
+    '<border><left/><right/><top/><bottom/><diagonal/></border>',
+    '<border>' + thin + '</border>',
+  ];
+  // Order here MUST match STYLES above (plain=0, title=1, header=2, daylabel=3, data=4, missing=5).
+  const cellXfs = [
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',
+    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>',
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>',
+    '<xf numFmtId="0" fontId="1" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>',
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>',
+    '<xf numFmtId="0" fontId="3" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>',
+  ];
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    + '<fonts count="' + fonts.length + '">' + fonts.join('') + '</fonts>'
+    + '<fills count="' + fills.length + '">' + fills.join('') + '</fills>'
+    + '<borders count="' + borders.length + '">' + borders.join('') + '</borders>'
+    + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    + '<cellXfs count="' + cellXfs.length + '">' + cellXfs.join('') + '</cellXfs>'
+    + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    + '</styleSheet>';
 }
 
 const CONTENT_TYPES_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
   + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
   + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
   + '<Default Extension="xml" ContentType="application/xml"/>'
-  + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>';
+  + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+  + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
 const ROOT_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
   + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
   + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
@@ -164,13 +236,15 @@ function buildWorkbook(sheets) {
 
   sheets.forEach((sheet, i) => {
     const idx = i + 1;
-    files.push({ name: 'xl/worksheets/sheet' + idx + '.xml', data: Buffer.from(buildSheetXml(sheet.rows, sheet.colWidths), 'utf8') });
+    files.push({ name: 'xl/worksheets/sheet' + idx + '.xml', data: Buffer.from(buildSheetXml(sheet.rows, sheet.colWidths, sheet), 'utf8') });
     contentTypes += '<Override PartName="/xl/worksheets/sheet' + idx + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
     workbookRels += '<Relationship Id="rId' + idx + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + idx + '.xml"/>';
     // sheet names must be XML-safe and <=31 chars; truncate defensively rather than produce an invalid file
     const safeName = xmlEscape(sheet.name).slice(0, 31);
     sheetsXml += '<sheet name="' + safeName + '" sheetId="' + idx + '" r:id="rId' + idx + '"/>';
   });
+  const stylesRelId = 'rId' + (sheets.length + 1);
+  workbookRels += '<Relationship Id="' + stylesRelId + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>';
   contentTypes += '</Types>';
   workbookRels += '</Relationships>';
 
@@ -183,8 +257,9 @@ function buildWorkbook(sheets) {
   files.push({ name: '_rels/.rels', data: Buffer.from(ROOT_RELS, 'utf8') });
   files.push({ name: 'xl/workbook.xml', data: Buffer.from(workbookXml, 'utf8') });
   files.push({ name: 'xl/_rels/workbook.xml.rels', data: Buffer.from(workbookRels, 'utf8') });
+  files.push({ name: 'xl/styles.xml', data: Buffer.from(buildStylesXml(), 'utf8') });
 
   return makeZip(files);
 }
 
-module.exports = { buildWorkbook };
+module.exports = { buildWorkbook, STYLES };
