@@ -155,7 +155,7 @@ function makeApp(store, opts) {
     if (!body.name || !body.roleId || !body.pin) return sendJson(res, 400, { error: 'missing_fields' });
     if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
-    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null, gender: body.gender || null });
+    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null, gender: body.gender || null, isSenior: !!body.isSenior });
     return sendJson(res, 200, { employee: emp });
   });
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
@@ -202,7 +202,7 @@ function makeApp(store, opts) {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
     const week = await store.getScheduleWeek(params.weekStart);
-    return sendJson(res, 200, { week: week || { weekStart: params.weekStart, assignments: [], understaffed: [], generatedAt: null } });
+    return sendJson(res, 200, { week: week || { weekStart: params.weekStart, assignments: [], understaffed: [], seniorIssues: [], generatedAt: null } });
   });
   route('POST', '/api/schedule/:weekStart/generate', async (req, res, params, body) => {
     const session = await requireSession(req);
@@ -232,17 +232,22 @@ function makeApp(store, opts) {
   route('POST', '/api/schedule/:weekStart/assign', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
-    const [templates, constraints, employee] = await Promise.all([
-      store.listShiftTemplates(), store.listConstraints(body.employeeId), store.getEmployee(body.employeeId),
+    const [templates, availRows, employee] = await Promise.all([
+      store.listShiftTemplates(), store.listAvailability({ employeeId: body.employeeId, fromDate: body.date, toDate: body.date }), store.getEmployee(body.employeeId),
     ]);
     const template = templates.find(t => t.id === body.shiftTemplateId);
-    const constraintConflict = !!template && S.isBlocked(body.employeeId, body.date, template.start, template.end, constraints);
+    let constraintConflict = false;
+    if (template) {
+      const bucket = S.timeBucketOf(template);
+      const choice = availRows.length ? availRows[0].choice : 'all'; // no submission yet => treated as available
+      constraintConflict = !S.isAvailableForShift(choice, bucket);
+    }
     const id = await store.addAssignment(params.weekStart, body.date, body.shiftTemplateId, body.employeeId);
     if (constraintConflict) {
       const desc = (template.label + ' ' + body.date + ' (' + template.start + '-' + template.end + ')');
       await store.addNotification({
         audience: 'manager', type: 'constraint-conflict', relatedId: id,
-        text: 'שובץ/ה ' + (employee ? employee.name : 'עובד/ת') + ' למשמרת ' + desc + ' בניגוד לאילוץ שהגיש/ה.',
+        text: 'שובץ/ה ' + (employee ? employee.name : 'עובד/ת') + ' למשמרת ' + desc + ' בניגוד לזמינות שהגיש/ה.',
         severity: 'warning', channels: ['inapp'],
       });
     }
@@ -273,6 +278,27 @@ function makeApp(store, opts) {
       const me = await store.getEmployee(session.employeeId);
       swaps = swaps.filter(s => s.roleId === me.roleId || s.requesterId === session.employeeId);
     }
+    // Still-open requests get a "potential replacement" candidate list: active employees of the
+    // same role, other than the requester, whose submitted availability actually covers this
+    // shift's date/time-of-day. Skipped for resolved requests — nobody needs to see it once a
+    // request is claimed or cancelled.
+    const openOnes = swaps.filter(s => s.status === 'open');
+    if (openOnes.length) {
+      const [employees, templates] = await Promise.all([store.listEmployees(), store.listShiftTemplates()]);
+      const templatesById = {}; templates.forEach(t => { templatesById[t.id] = t; });
+      for (const s of openOnes) {
+        const template = s.shiftTemplateId ? templatesById[s.shiftTemplateId] : null;
+        if (!template || !s.date) { s.candidates = []; continue; }
+        const bucket = S.timeBucketOf(template);
+        const avail = await store.listAvailability({ fromDate: s.date, toDate: s.date });
+        const choiceByEmp = {}; avail.forEach(a => { choiceByEmp[a.employeeId] = a.choice; });
+        s.candidates = employees
+          .filter(e => e.active && e.roleId === s.roleId && e.id !== s.requesterId)
+          .filter(e => S.isAvailableForShift(choiceByEmp[e.id] === undefined ? 'all' : choiceByEmp[e.id], bucket))
+          .map(e => ({ id: e.id, name: e.name }));
+      }
+    }
+    swaps.forEach(s => { if (s.candidates === undefined) s.candidates = []; });
     return sendJson(res, 200, { swaps });
   });
   route('POST', '/api/swaps/:id/claim', async (req, res, params) => {
@@ -321,6 +347,41 @@ function makeApp(store, opts) {
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
     const employeeId = session.type === 'employee' ? session.employeeId : null;
     await store.deleteConstraint(params.id, employeeId);
+    return sendJson(res, 200, { ok: true });
+  });
+
+  // ---- availability (the 5-choice-per-day model that replaced free-form constraints) ----
+  const AVAILABILITY_CHOICES = ['all', 'morning', 'noon', 'night', 'none'];
+  route('GET', '/api/availability', async (req, res, params, body, query) => {
+    const session = await requireSession(req);
+    if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const weekStart = query.get('weekStart');
+    const fromDate = weekStart || undefined;
+    const toDate = weekStart ? S.addDays(weekStart, 6) : undefined;
+    const employeeId = session.type === 'manager' ? (query.get('employeeId') || undefined) : session.employeeId;
+    return sendJson(res, 200, { availability: await store.listAvailability({ employeeId, fromDate, toDate }) });
+  });
+  route('POST', '/api/availability', async (req, res, params, body) => {
+    const session = await requireSession(req);
+    if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const employeeId = session.type === 'manager' ? (body.employeeId || null) : session.employeeId;
+    if (!employeeId) return sendJson(res, 400, { error: 'missing_employee' });
+    const weekStart = body.weekStart;
+    const days = Array.isArray(body.days) ? body.days : [];
+    if (!weekStart || days.length !== 7) return sendJson(res, 400, { error: 'invalid_payload' });
+    const expectedDates = [0, 1, 2, 3, 4, 5, 6].map(d => S.addDays(weekStart, d));
+    const byDate = {};
+    days.forEach(d => { byDate[d.date] = d.choice; });
+    for (const ds of expectedDates) {
+      if (!AVAILABILITY_CHOICES.includes(byDate[ds])) return sendJson(res, 400, { error: 'invalid_choice' });
+    }
+    if (session.type === 'employee') {
+      const settings = await store.getSettings();
+      if (S.constraintDeadlinePassed(weekStart, settings.weeklyGenerationDow)) {
+        return sendJson(res, 409, { error: 'deadline_passed' });
+      }
+    }
+    await store.setWeekAvailability(employeeId, expectedDates.map(ds => ({ date: ds, choice: byDate[ds] })));
     return sendJson(res, 200, { ok: true });
   });
 
