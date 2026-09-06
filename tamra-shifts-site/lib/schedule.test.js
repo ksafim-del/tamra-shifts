@@ -18,6 +18,27 @@ test('constraintDeadlinePassed: locked week is blocked, far future week is not',
   assert.strictEqual(S.constraintDeadlinePassed('2026-09-22', 4, now), false); // far future, open
 });
 
+test('timeBucketOf buckets a shift by its start time, except a "ביניים" (split) shift which always requires all-day availability', () => {
+  assert.strictEqual(S.timeBucketOf({ label: 'בוקר מתדלקים', start: '05:00' }), 'morning');
+  assert.strictEqual(S.timeBucketOf({ label: 'בוקר חנות', start: '06:00' }), 'morning');
+  assert.strictEqual(S.timeBucketOf({ label: 'צהריים מתדלקים', start: '13:00' }), 'noon');
+  assert.strictEqual(S.timeBucketOf({ label: 'לילה מתדלקים', start: '21:00' }), 'night');
+  assert.strictEqual(S.timeBucketOf({ label: 'ביניים מתדלקים (שבת)', start: '09:00' }), 'all');
+  assert.strictEqual(S.timeBucketOf({ label: 'ביניים חנות', start: '10:00' }), 'all');
+  // boundary cases: exactly 12:00 is noon, exactly 17:00 is night
+  assert.strictEqual(S.timeBucketOf({ label: 'x', start: '12:00' }), 'noon');
+  assert.strictEqual(S.timeBucketOf({ label: 'x', start: '17:00' }), 'night');
+});
+
+test('isAvailableForShift: "all" covers every bucket, "none" covers nothing, a specific bucket only matches itself', () => {
+  assert.strictEqual(S.isAvailableForShift('all', 'morning'), true);
+  assert.strictEqual(S.isAvailableForShift('all', 'night'), true);
+  assert.strictEqual(S.isAvailableForShift('none', 'morning'), false);
+  assert.strictEqual(S.isAvailableForShift('morning', 'morning'), true);
+  assert.strictEqual(S.isAvailableForShift('morning', 'noon'), false);
+  assert.strictEqual(S.isAvailableForShift(undefined, 'morning'), false, 'an explicit missing/falsy choice is treated as unavailable by this pure function — callers default a truly-unsubmitted day to \'all\' themselves');
+});
+
 test('durationHours handles overnight shifts', () => {
   assert.strictEqual(S.durationHours('21:00', '05:00'), 8);
   assert.strictEqual(S.durationHours('05:00', '13:00'), 8);
@@ -97,6 +118,32 @@ test('generateSchedule only applies a Saturday-only template (days:[6]) on Satur
   assert.strictEqual(result.assignments[0].date, '2026-09-05'); // the Saturday of that week
 });
 
+test('generateSchedule only assigns employees matching a template\'s requiredGender (store night = male-only)', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'store-night', roleId: 'store', start: '21:00', end: '07:00', needed: 1, active: true, days: [0,1,2,3,4,5,6], requiredGender: 'male' },
+  ];
+  const employees = [
+    { id: 'e0', name: 'Female', roleId: 'store', active: true, gender: 'female' },
+    { id: 'e1', name: 'Male', roleId: 'store', active: true, gender: 'male' },
+  ];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, constraints: [], meta, priorAssignments: [] });
+  assert.strictEqual(result.assignments.length, 7);
+  assert.ok(result.assignments.every(a => a.employeeId === 'e1'), 'only the male employee should ever be chosen for the night store shift');
+});
+
+test('generateSchedule reports understaffed (not a silent skip) when requiredGender leaves nobody eligible', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'store-night', roleId: 'store', start: '21:00', end: '07:00', needed: 1, active: true, days: [0], requiredGender: 'male' },
+  ];
+  const employees = [{ id: 'e0', name: 'Female', roleId: 'store', active: true, gender: 'female' }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, constraints: [], meta, priorAssignments: [] });
+  assert.strictEqual(result.assignments.length, 0);
+  assert.strictEqual(result.understaffed.length, 1);
+  assert.strictEqual(result.understaffed[0].missing, 1);
+});
+
 test('computeMonthlyHours buckets sum to total and shabbat/night take priority', () => {
   const meta = { nightStart: '22:00', nightEnd: '06:00', shabbatStartDay: 5, shabbatStartTime: '16:00', shabbatEndDay: 6, shabbatEndTime: '20:00', dailyOvertimeThreshold: 8 };
   const templatesById = { 'fuel-night': { id: 'fuel-night', start: '21:00', end: '05:00' } };
@@ -106,6 +153,97 @@ test('computeMonthlyHours buckets sum to total and shabbat/night take priority',
   const b = result['e0'];
   assert.ok(Math.abs(b.total - 8) < 0.01);
   assert.ok(b.shabbat > 0, 'expected some shabbat hours for a Friday night shift');
+});
+
+test('generateSchedule respects submitted availability: unavailable employees are skipped, missing submissions default to available', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-morning', label: 'בוקר מתדלקים', roleId: 'fuel', start: '05:00', end: '13:00', needed: 1, active: true, days: [0] },
+  ];
+  // e0 explicitly marked unavailable that morning; e1 explicitly marked available; e2 never submitted anything.
+  const employees = [
+    { id: 'e0', name: 'E0', roleId: 'fuel', active: true },
+    { id: 'e1', name: 'E1', roleId: 'fuel', active: true },
+    { id: 'e2', name: 'E2', roleId: 'fuel', active: true },
+  ];
+  const availability = [
+    { employeeId: 'e0', date: '2026-08-30', choice: 'none' },
+    { employeeId: 'e1', date: '2026-08-30', choice: 'morning' },
+  ];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability, meta, priorAssignments: [] });
+  const chosenIds = result.assignments.map(a => a.employeeId);
+  assert.ok(!chosenIds.includes('e0'), 'explicitly unavailable employee must never be chosen');
+  // e1 (explicitly available) and e2 (never submitted -> defaults to available) are both eligible;
+  // needed is 1, so exactly one of them gets it — either is correct, e0 never is.
+  assert.strictEqual(chosenIds.length, 1);
+  assert.ok(chosenIds[0] === 'e1' || chosenIds[0] === 'e2');
+});
+
+test('generateSchedule: an availability choice outside the shift\'s time bucket excludes the employee (e.g. "morning-only" for an afternoon shift)', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-noon', label: 'צהריים מתדלקים', roleId: 'fuel', start: '13:00', end: '21:00', needed: 1, active: true, days: [0] },
+  ];
+  const employees = [{ id: 'e0', name: 'E0', roleId: 'fuel', active: true }];
+  const availability = [{ employeeId: 'e0', date: '2026-08-30', choice: 'morning' }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability, meta, priorAssignments: [] });
+  assert.strictEqual(result.assignments.length, 0);
+  assert.strictEqual(result.understaffed.length, 1);
+});
+
+test('generateSchedule: a "ביניים" shift only accepts employees who marked "all day" availability, even if they picked the shift\'s own start-of-day bucket', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-beinaim', label: 'ביניים מתדלקים (שבת)', roleId: 'fuel', start: '09:00', end: '21:00', needed: 1, active: true, days: [6] },
+  ];
+  const employees = [
+    { id: 'e0', name: 'MorningOnly', roleId: 'fuel', active: true },
+    { id: 'e1', name: 'AllDay', roleId: 'fuel', active: true },
+  ];
+  const availability = [
+    { employeeId: 'e0', date: '2026-09-05', choice: 'morning' }, // Saturday
+    { employeeId: 'e1', date: '2026-09-05', choice: 'all' },
+  ];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability, meta, priorAssignments: [] });
+  assert.deepStrictEqual(result.assignments.map(a => a.employeeId), ['e1']);
+});
+
+test('generateSchedule: a fuel shift staffed but with no senior fuel attendant available is flagged in seniorIssues, not understaffed', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-morning', label: 'בוקר מתדלקים', roleId: 'fuel', start: '05:00', end: '13:00', needed: 1, active: true, days: [0] },
+  ];
+  const employees = [{ id: 'e0', name: 'Junior', roleId: 'fuel', active: true, isSenior: false }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability: [], meta, priorAssignments: [] });
+  assert.strictEqual(result.assignments.length, 1, 'the shift is still filled as usual');
+  assert.strictEqual(result.understaffed.length, 0, 'headcount is met, so this is not an understaffed slot');
+  assert.deepStrictEqual(result.seniorIssues, [{ date: '2026-08-30', shiftTemplateId: 'fuel-morning' }]);
+});
+
+test('generateSchedule: prefers swapping in an available senior fuel attendant over a strict hours-fairness pick, when one is available', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'fuel-morning', label: 'בוקר מתדלקים', roleId: 'fuel', start: '05:00', end: '13:00', needed: 1, active: true, days: [0] },
+  ];
+  // e0 has fewer hours so far (would normally win the fairness sort) but isn't senior; e1 is senior.
+  const employees = [
+    { id: 'e0', name: 'Junior', roleId: 'fuel', active: true, isSenior: false },
+    { id: 'e1', name: 'Senior', roleId: 'fuel', active: true, isSenior: true },
+  ];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability: [], meta, priorAssignments: [] });
+  assert.deepStrictEqual(result.assignments.map(a => a.employeeId), ['e1']);
+  assert.strictEqual(result.seniorIssues.length, 0);
+});
+
+test('generateSchedule: senior-swap rule only applies to fuel shifts, never store', () => {
+  const meta = { minRestHours: 24 };
+  const shiftTemplates = [
+    { id: 'store-morning', label: 'בוקר חנות', roleId: 'store', start: '06:00', end: '13:00', needed: 1, active: true, days: [0] },
+  ];
+  const employees = [{ id: 'e0', name: 'Store', roleId: 'store', active: true, isSenior: false }];
+  const result = S.generateSchedule('2026-08-30', { employees, shiftTemplates, availability: [], meta, priorAssignments: [] });
+  assert.strictEqual(result.assignments.length, 1);
+  assert.deepStrictEqual(result.seniorIssues, [], 'the senior requirement is fuel-only');
 });
 
 console.log('All schedule.test.js assertions defined (run with `node --test`).');
