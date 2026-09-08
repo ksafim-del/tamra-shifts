@@ -27,6 +27,9 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){retu
 function roleClass(id){ return id==='fuel'?'role-fuel':(id==='store'?'role-store':'role-other'); }
 function roleLabel(id){ return id==='fuel'?'מתדלק/ת':(id==='store'?'עובד/ת חנות':'פקיד/ה (הוסר)'); }
 function roleLabelPlural(id){ return id==='fuel'?'מתדלקים':(id==='store'?'עובדי חנות':'אחר'); }
+// Grammatically-correct "כל ה..." phrasing per role (roleLabelPlural alone doesn't take a
+// uniform "ה" prefix: "כל המתדלקים" vs "כל עובדי החנות").
+function roleTeamPhrase(id){ return id==='fuel'?'כל המתדלקים':(id==='store'?'כל עובדי החנות':'כל הצוות'); }
 function genderLabel(g){ return g==='male'?'זכר':(g==='female'?'נקבה':'לא צוין'); }
 function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-female':'gender-unset'); }
 
@@ -853,13 +856,16 @@ function settingsHtml() {
 }
 
 /* ---------- employee: my schedule ---------- */
-// Read-only weekly grid of everyone's shifts (no assign/remove controls) — used by the
-// employee "לוז כל הצוות" toggle so employees can see who else is working, not just themselves.
+// Read-only weekly grid of shifts (no assign/remove controls) — used by the employee
+// "לוז כל הצוות" toggle so employees can see who else is working. Scoped to the viewer's own
+// role (fuel attendants see only fuel shifts, store employees see only store shifts) — the two
+// teams don't work together, so cross-role visibility would just be noise/confusion for them.
 function teamScheduleHtml(wk, week) {
+  var myRole = STATE.me.roleId;
   return '<div class="calgrid">' + [0, 1, 2, 3, 4, 5, 6].map(function (d) {
     var ds = addDays(wk, d);
     var dow = dowOfDateStr(ds);
-    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.days.indexOf(dow) !== -1; })
+    var templates = STATE.shiftTemplates.filter(function (t) { return t.active && t.roleId === myRole && t.days.indexOf(dow) !== -1; })
       .sort(function (a, b) { return timeToMinutes(a.start) - timeToMinutes(b.start); });
     var body;
     if (!templates.length) {
@@ -891,10 +897,10 @@ function myScheduleHtml() {
   var wk = ui.currentWeek;
   var week = CACHE.weeks[wk];
   var viewAll = ui.myScheduleView === 'all';
-  var html = '<div class="card"><div class="card-head"><h2>' + (viewAll ? 'הלוז של כולם — ' : 'הלוז שלי — ') + weekLabel(wk) + '</h2>'
+  var html = '<div class="card"><div class="card-head"><h2>' + (viewAll ? ('הלוז של ' + roleTeamPhrase(STATE.me.roleId) + ' — ') : 'הלוז שלי — ') + weekLabel(wk) + '</h2>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
     + '<button class="btn secondary sm" data-action="week-prev">◀</button> <button class="btn secondary sm" data-action="week-next">▶</button>'
-    + '<button class="btn ' + (viewAll ? '' : 'secondary') + ' sm" data-action="toggle-my-schedule-view">' + (viewAll ? '👤 הלוז שלי' : '👥 לוז כל הצוות') + '</button>'
+    + '<button class="btn ' + (viewAll ? '' : 'secondary') + ' sm" data-action="toggle-my-schedule-view">' + (viewAll ? '👤 הלוז שלי' : '👥 לוז ' + roleTeamPhrase(STATE.me.roleId)) + '</button>'
     + '</div></div>';
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
   if (!week.generatedAt) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
