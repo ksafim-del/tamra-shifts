@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_audience ON notifications(audience, employee_id);
+-- One row per browser/device that has enabled push notifications (public/app.js's
+-- push-subscribe flow). Keyed by endpoint (unique per browser+device+site) rather than by
+-- employee, so the same login on two phones just makes two rows — broadcasts (lib/push.js)
+-- send to every row regardless of who it belongs to.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT,
+  created_at BIGINT NOT NULL
+);
 `;
 
 const DEFAULT_SETTINGS = {
@@ -634,6 +647,29 @@ function makeStore(db) {
       } else {
         await db.run('UPDATE notifications SET read = 1 WHERE read = 0', []);
       }
+    },
+
+    // ---- push subscriptions (see lib/push.js) ----
+    // Upsert by endpoint: re-subscribing (e.g. the browser rotated the subscription, or the
+    // same person just re-enabled notifications) updates the existing row instead of piling up
+    // duplicates that would each get a push.
+    async savePushSubscription(sub) {
+      const existing = await db.get('SELECT id FROM push_subscriptions WHERE endpoint = ?', [sub.endpoint]);
+      if (existing) {
+        await db.run('UPDATE push_subscriptions SET p256dh = ?, auth = ?, subject_type = ?, subject_id = ? WHERE endpoint = ?',
+          [sub.p256dh, sub.auth, sub.subjectType, sub.subjectId || null, sub.endpoint]);
+        return existing.id;
+      }
+      const id = uid();
+      await db.run('INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, subject_type, subject_id, created_at) VALUES (?,?,?,?,?,?,?)',
+        [id, sub.endpoint, sub.p256dh, sub.auth, sub.subjectType, sub.subjectId || null, Date.now()]);
+      return id;
+    },
+    async deletePushSubscription(endpoint) {
+      await db.run('DELETE FROM push_subscriptions WHERE endpoint = ?', [endpoint]);
+    },
+    async listPushSubscriptions() {
+      return db.all('SELECT * FROM push_subscriptions', []);
     },
   };
 }
