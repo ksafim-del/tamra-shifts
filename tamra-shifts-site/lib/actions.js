@@ -4,6 +4,7 @@
 // "automatic Thursday generate" are guaranteed to behave identically.
 const S = require('./schedule.js');
 const mailer = require('./mailer.js');
+const push = require('./push.js');
 
 async function generateWeek(store, weekStart, { force } = {}) {
   const existing = await store.getScheduleWeek(weekStart);
@@ -77,6 +78,17 @@ async function generateWeek(store, weekStart, { force } = {}) {
     await mailer.sendMail({ to: settings.managerEmail, subject, text: body });
   }
 
+  // Push to every phone with notifications enabled — never lets a push-service hiccup fail
+  // the actual schedule generation, which has already been saved above.
+  await push.broadcastToAll(store, {
+    title: 'תמרה משמרות',
+    body: result.understaffed.length
+      ? ('הלוז לשבוע ' + weekStart + ' הופק — ' + result.understaffed.length + ' משמרות ללא איוש')
+      : ('הלוז לשבוע ' + weekStart + ' הופק בהצלחה, כל המשמרות מאוישות'),
+    tag: 'schedule-' + weekStart,
+    url: '/',
+  }).catch((err) => console.error('[push] schedule-generated broadcast failed:', err && err.message));
+
   return { skipped: false, week: await store.getScheduleWeek(weekStart) };
 }
 
@@ -120,6 +132,15 @@ async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
       });
     }
   }
+
+  // Push to every phone with notifications enabled (not just the peers who can take the
+  // shift) — the manager especially needs to see this even outside the app.
+  await push.broadcastToAll(store, {
+    title: 'תמרה משמרות',
+    body: requester.name + ' ' + label + ' משמרת: ' + desc,
+    tag: 'swap-' + swapId,
+    url: '/',
+  }).catch((err) => console.error('[push] swap-request broadcast failed:', err && err.message));
 
   return swapId;
 }
