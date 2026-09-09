@@ -9,6 +9,7 @@ const actions = require('./actions.js');
 const xlsxTruth = require('./xlsx-truth.js');
 const xlsxWriter = require('./xlsx-writer.js');
 const scheduleExport = require('./schedule-export.js');
+const push = require('./push.js');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -140,7 +141,27 @@ function makeApp(store, opts) {
     };
     let me = null;
     if (session.type === 'employee') { me = await store.getEmployee(session.employeeId); }
-    return sendJson(res, 200, { session, me, settings: publicSettings, employees, shiftTemplates });
+    return sendJson(res, 200, { session, me, settings: publicSettings, employees, shiftTemplates, pushPublicKey: push.getPublicKey() });
+  });
+
+  // ---- push notifications (see lib/push.js + public/sw.js) ----
+  route('POST', '/api/push/subscribe', async (req, res, params, body) => {
+    const session = await requireSession(req);
+    if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const sub = body && body.subscription;
+    if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return sendJson(res, 400, { error: 'invalid_subscription' });
+    await store.savePushSubscription({
+      endpoint: sub.endpoint, p256dh: sub.keys.p256dh, auth: sub.keys.auth,
+      subjectType: session.type, subjectId: session.type === 'employee' ? session.employeeId : null,
+    });
+    return sendJson(res, 200, { ok: true });
+  });
+  route('POST', '/api/push/unsubscribe', async (req, res, params, body) => {
+    const session = await requireSession(req);
+    if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    if (!body || !body.endpoint) return sendJson(res, 400, { error: 'missing_endpoint' });
+    await store.deletePushSubscription(body.endpoint);
+    return sendJson(res, 200, { ok: true });
   });
 
   // ---- employees (manager only) ----
