@@ -37,7 +37,7 @@ function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-f
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine' };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine', pushSupported:null, pushSubscribed:false, pushBusy:false };
 
 /* ---------- api ---------- */
 function api(method, path, body) {
@@ -70,7 +70,69 @@ function boot() {
     STATE = r.data;
     if (!ui.tab) ui.tab = STATE.session.type === 'manager' ? 'overview' : 'myschedule';
     render();
+    refreshPushState();
   });
+}
+
+/* ---------- push notifications (see lib/push.js + public/sw.js) ---------- */
+// The VAPID public key travels as a base64url string (STATE.pushPublicKey, from
+// /api/bootstrap) but PushManager.subscribe() needs it as a raw byte array.
+function urlBase64ToUint8Array(base64url) {
+  var padding = '='.repeat((4 - (base64url.length % 4)) % 4);
+  var base64 = (base64url + padding).replace(/-/g, '+').replace(/_/g, '/');
+  var raw = atob(base64);
+  var out = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+function isIosDevice() { return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream; }
+function isStandaloneApp() { return window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches); }
+
+// Reflects whatever the browser already knows (a previous subscribe that survived a reload)
+// into ui.pushSubscribed, so the topbar button shows the right state on load — does not
+// prompt for permission by itself.
+function refreshPushState() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !window.isSecureContext) { ui.pushSupported = false; render(); return; }
+  ui.pushSupported = true;
+  navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); })
+    .then(function (sub) { ui.pushSubscribed = !!sub; render(); })
+    .catch(function () {});
+}
+function subscribeToPush() {
+  if (isIosDevice() && !isStandaloneApp()) {
+    toast('כדי לקבל התראות ב-iPhone צריך קודם להוסיף את האתר למסך הבית (שיתוף ⬆️ ← הוספה למסך הבית), ולפתוח אותו משם', 'err');
+    return;
+  }
+  if (!STATE.pushPublicKey) { toast('התראות עדיין לא הופעלו באתר', 'err'); return; }
+  ui.pushBusy = true; render();
+  navigator.serviceWorker.ready
+    .then(function (reg) { return Notification.requestPermission().then(function (perm) { return { reg: reg, perm: perm }; }); })
+    .then(function (r) {
+      if (r.perm !== 'granted') { throw new Error('permission_denied'); }
+      return r.reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(STATE.pushPublicKey) });
+    })
+    .then(function (sub) { return api('POST', '/api/push/subscribe', { subscription: sub.toJSON() }); })
+    .then(function (r) {
+      ui.pushBusy = false;
+      if (r.ok) { ui.pushSubscribed = true; toast('התראות הופעלו 🔔', 'ok'); } else { toast('שגיאה בהפעלת התראות', 'err'); }
+      render();
+    })
+    .catch(function (e) {
+      ui.pushBusy = false;
+      toast(e && e.message === 'permission_denied' ? 'לא ניתנה הרשאה להתראות' : 'שגיאה בהפעלת התראות', 'err');
+      render();
+    });
+}
+function unsubscribeFromPush() {
+  ui.pushBusy = true; render();
+  navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); })
+    .then(function (sub) {
+      if (!sub) return null;
+      var endpoint = sub.endpoint;
+      return sub.unsubscribe().then(function () { return api('POST', '/api/push/unsubscribe', { endpoint: endpoint }); });
+    })
+    .then(function () { ui.pushBusy = false; ui.pushSubscribed = false; toast('התראות כובו'); render(); })
+    .catch(function () { ui.pushBusy = false; render(); });
 }
 
 function login(mode, employeeId, pin) {
@@ -160,6 +222,7 @@ function handleAction(action, el, ev) {
   if (action === 'seg-mode') { ui.loginMode = el.getAttribute('data-mode'); ui.loginErr = ''; render(); return; }
   if (action === 'set-tab') { ui.tab = el.getAttribute('data-tab'); ui.modal = null; render(); ensureTabData(); return; }
   if (action === 'logout') { logout(); return; }
+  if (action === 'toggle-push-notif') { if (!ui.pushBusy) { if (ui.pushSubscribed) unsubscribeFromPush(); else subscribeToPush(); } return; }
   if (action === 'close-modal') { closeModal(); return; }
 
   if (action === 'week-prev') { ui.currentWeek = addWeeks(ui.currentWeek, -1); render(); loadWeek(ui.currentWeek); return; }
@@ -468,8 +531,9 @@ function shellHtml() {
       default: body = '';
     }
   }
+  var pushBtn = ui.pushSupported === false ? '' : '<button class="iconbtn" data-action="toggle-push-notif" title="' + (ui.pushSubscribed ? 'התראות פעילות בטלפון — לחיצה לכיבוי' : 'הפעלת התראות בטלפון') + '"' + (ui.pushBusy ? ' disabled' : '') + '>' + (ui.pushSubscribed ? '🔔' : '🔕') + '</button>';
   return '<div class="topbar"><div class="brand">' + esc(STATE.settings.companyName || 'תמרה') + '<small>' + (isMgr ? 'ממשק ניהול' : esc(STATE.me ? STATE.me.name : '')) + '</small></div>'
-    + '<div style="display:flex;gap:8px;"><button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
+    + '<div style="display:flex;gap:8px;">' + pushBtn + '<button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
     + '<div class="tabbar">' + tabs.map(function (t) { return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '"><span class="tab-ic">' + t[2] + '</span><span class="tab-lb">' + t[1] + '</span></button>'; }).join('') + '</div>'
     + '<div class="wrap">' + body + '</div>'
     + modalHtml();
