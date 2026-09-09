@@ -414,3 +414,28 @@ test('getScheduleWeek drops understaffed entries for a shift template that was l
   assert.strictEqual(week.understaffed.length, 1, 'stale entry for the deactivated office template should be filtered out');
   assert.strictEqual(week.understaffed[0].shiftTemplateId, activeTpl.id);
 });
+
+test('push subscriptions: saving is an upsert keyed by endpoint, and listing/deleting work as expected', async () => {
+  const store = await freshStore();
+  await store.savePushSubscription({ endpoint: 'ep-1', p256dh: 'p1', auth: 'a1', subjectType: 'manager', subjectId: null });
+  await store.savePushSubscription({ endpoint: 'ep-2', p256dh: 'p2', auth: 'a2', subjectType: 'employee', subjectId: 'emp-9' });
+  let rows = await store.listPushSubscriptions();
+  assert.strictEqual(rows.length, 2);
+
+  // re-subscribing the same endpoint (browser rotated keys) updates in place, not a 3rd row
+  await store.savePushSubscription({ endpoint: 'ep-1', p256dh: 'p1-new', auth: 'a1-new', subjectType: 'manager', subjectId: null });
+  rows = await store.listPushSubscriptions();
+  assert.strictEqual(rows.length, 2, 'upsert by endpoint must not create a duplicate row');
+  const ep1 = rows.find(r => r.endpoint === 'ep-1');
+  assert.strictEqual(ep1.p256dh, 'p1-new');
+  assert.strictEqual(ep1.auth, 'a1-new');
+
+  const ep2 = rows.find(r => r.endpoint === 'ep-2');
+  assert.strictEqual(ep2.subject_type, 'employee');
+  assert.strictEqual(ep2.subject_id, 'emp-9');
+
+  await store.deletePushSubscription('ep-1');
+  rows = await store.listPushSubscriptions();
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rows[0].endpoint, 'ep-2');
+});
