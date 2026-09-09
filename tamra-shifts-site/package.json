@@ -8,12 +8,13 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test lib/schedule.test.js lib/store.test.js lib/server.test.js lib/xlsx-truth.test.js lib/schedule-export.test.js lib/xlsx-writer.test.js",
+    "test": "node --test lib/schedule.test.js lib/store.test.js lib/server.test.js lib/xlsx-truth.test.js lib/schedule-export.test.js lib/xlsx-writer.test.js lib/push.test.js",
     "cron:generate": "node scripts/cron-generate.js"
   },
   "dependencies": {
     "nodemailer": "^6.9.14",
-    "pg": "^8.12.0"
+    "pg": "^8.12.0",
+    "web-push": "^3.6.6"
   },
   "license": "UNLICENSED",
   "private": true
