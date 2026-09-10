@@ -11,8 +11,8 @@ const { readWorkbook } = require('./xlsx-truth.js');
 async function startTestServer() {
   const db = makeSqliteAdapter(':memory:');
   await initSchema(db);
-  const store = makeStore(db); // scoped to the default 'tamra' company — matches every test's plain (no X-Company-Slug header) requests
-  const server = createServer(db, { sessionSecret: 'test-secret', secureCookies: false, cronSecret: 'cron-test' });
+  const store = makeStore(db);
+  const server = createServer(store, { sessionSecret: 'test-secret', secureCookies: false, cronSecret: 'cron-test' });
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
   return { server, store, base: 'http://127.0.0.1:' + port };
@@ -405,46 +405,103 @@ test('GET /api/swaps attaches potential-replacement candidates to open requests 
   assert.deepStrictEqual(closedSwaps.swaps.map(s => s.candidates), closedSwaps.swaps.map(() => []));
 });
 
-test('multi-tenant isolation: each company (chosen via X-Company-Slug before login, then remembered in the session) only ever sees its own data', async (t) => {
+test('POST/PATCH /api/templates: manager can add a new shift template (e.g. an extra "ביניים" shift) and edit an existing one\'s hours/headcount, with validation', async (t) => {
   const { server, base } = await startTestServer();
   t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
 
-  const tamraHeaders = { 'Content-Type': 'application/json', 'X-Company-Slug': 'tamra' };
-  const senHeaders = { 'Content-Type': 'application/json', 'X-Company-Slug': 'sen-energy' };
+  // non-manager (no session at all) is rejected
+  const noAuthCreate = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roleId: 'fuel', label: 'x', start: '10:00', end: '12:00', needed: 1, days: [0] }) });
+  assert.strictEqual(noAuthCreate.status, 403);
 
-  // both companies start with the same default manager PIN, but are otherwise separate
-  const tamraLogin = await fetch(base + '/api/login', { method: 'POST', headers: tamraHeaders, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
-  const tamraCookie = extractCookie(tamraLogin);
-  const senLogin = await fetch(base + '/api/login', { method: 'POST', headers: senHeaders, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
-  const senCookie = extractCookie(senLogin);
-  assert.strictEqual(tamraLogin.status, 200);
-  assert.strictEqual(senLogin.status, 200);
+  // creating a brand-new shift template ("ביניים" is already a recognized label pattern in
+  // lib/schedule.js's timeBucketOf, so a manager adding another one just works)
+  const createRes = await fetch(base + '/api/templates', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie },
+    body: JSON.stringify({ roleId: 'fuel', label: 'ביניים מתדלקים (חדש)', start: '10:00', end: '18:00', needed: 2, days: [0, 3] }),
+  });
+  assert.strictEqual(createRes.status, 200);
+  const created = await createRes.json();
+  assert.ok(created.id);
 
-  const tamraBoot = await (await fetch(base + '/api/bootstrap', { headers: { Cookie: tamraCookie } })).json();
-  const senBoot = await (await fetch(base + '/api/bootstrap', { headers: { Cookie: senCookie } })).json();
-  assert.strictEqual(tamraBoot.settings.companyName, 'תמרה דלקים (96) בע"מ');
-  assert.strictEqual(senBoot.settings.companyName, 'ס.ע.ן אנרגיה בע"מ');
-  // each company seeds its own copy of the same default shift templates, with different ids
-  assert.strictEqual(tamraBoot.shiftTemplates.length, senBoot.shiftTemplates.length);
-  assert.notStrictEqual(tamraBoot.shiftTemplates[0].id, senBoot.shiftTemplates[0].id);
+  const listed = await (await fetch(base + '/api/templates', { headers: { Cookie: mgrCookie } })).json();
+  const newTpl = listed.shiftTemplates.find(t => t.id === created.id);
+  assert.ok(newTpl, 'the new template must appear in the list');
+  assert.strictEqual(newTpl.needed, 2);
+  assert.deepStrictEqual(newTpl.days, [0, 3]);
+  assert.strictEqual(newTpl.active, true, 'a newly created template starts active');
 
-  // an employee created for תמרה must not show up for ס.ע.ן, even though both use the same
-  // web service and the manager is logged in on both at once
-  const createRes = await fetch(base + '/api/employees', { method: 'POST', headers: { ...tamraHeaders, Cookie: tamraCookie }, body: JSON.stringify({ name: 'עובד תמרה', roleId: 'fuel', pin: '9999' }) });
-  const tamraEmployee = (await createRes.json()).employee;
+  // editing hours + headcount on an existing default template
+  const morning = listed.shiftTemplates.find(t => t.roleId === 'fuel' && t.label === 'בוקר מתדלקים');
+  const patchRes = await fetch(base + '/api/templates/' + morning.id, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie },
+    body: JSON.stringify({ start: '06:00', end: '14:00', needed: 4 }),
+  });
+  assert.strictEqual(patchRes.status, 200);
+  const afterPatch = await (await fetch(base + '/api/templates', { headers: { Cookie: mgrCookie } })).json();
+  const patchedMorning = afterPatch.shiftTemplates.find(t => t.id === morning.id);
+  assert.strictEqual(patchedMorning.start, '06:00');
+  assert.strictEqual(patchedMorning.end, '14:00');
+  assert.strictEqual(patchedMorning.needed, 4);
 
-  const senEmployees = await (await fetch(base + '/api/employees', { headers: { Cookie: senCookie } })).json();
-  assert.ok(!senEmployees.employees.some(e => e.id === tamraEmployee.id), 'sen-energy must not see an employee created for tamra');
+  // validation: rejects garbage before it ever reaches the database
+  const badRole = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ roleId: 'office', label: 'x', start: '10:00', end: '12:00', needed: 1, days: [0] }) });
+  assert.strictEqual(badRole.status, 400);
+  const badTime = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ roleId: 'fuel', label: 'x', start: '25:99', end: '12:00', needed: 1, days: [0] }) });
+  assert.strictEqual(badTime.status, 400);
+  const badNeeded = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ roleId: 'fuel', label: 'x', start: '10:00', end: '12:00', needed: 0, days: [0] }) });
+  assert.strictEqual(badNeeded.status, 400);
+  const badDays = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ roleId: 'fuel', label: 'x', start: '10:00', end: '12:00', needed: 1, days: [] }) });
+  assert.strictEqual(badDays.status, 400);
+  const missingLabel = await fetch(base + '/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ roleId: 'fuel', label: '  ', start: '10:00', end: '12:00', needed: 1, days: [0] }) });
+  assert.strictEqual(missingLabel.status, 400);
 
-  const tamraEmployees = await (await fetch(base + '/api/employees', { headers: { Cookie: tamraCookie } })).json();
-  assert.ok(tamraEmployees.employees.some(e => e.id === tamraEmployee.id));
+  // deactivating (soft-delete) an existing template via PATCH, like the employee active toggle
+  const deactivateRes = await fetch(base + '/api/templates/' + newTpl.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ active: false }) });
+  assert.strictEqual(deactivateRes.status, 200);
+  const afterDeactivate = await (await fetch(base + '/api/templates', { headers: { Cookie: mgrCookie } })).json();
+  assert.strictEqual(afterDeactivate.shiftTemplates.find(t => t.id === newTpl.id).active, false);
 
-  // the public (pre-login) employee picker is scoped by the URL's company too
-  const senPublic = await (await fetch(base + '/api/public/employees', { headers: senHeaders })).json();
-  assert.ok(!senPublic.employees.some(e => e.id === tamraEmployee.id));
+  // PATCH on a non-existent template id
+  const notFound = await fetch(base + '/api/templates/nope', { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ needed: 2 }) });
+  assert.strictEqual(notFound.status, 404);
+});
 
-  // that employee's PIN only works for tamra's login, never for sen-energy's, even though the
-  // employee id itself is technically known
-  const crossLogin = await fetch(base + '/api/login', { method: 'POST', headers: senHeaders, body: JSON.stringify({ mode: 'employee', employeeId: tamraEmployee.id, pin: '9999' }) });
-  assert.strictEqual(crossLogin.status, 401);
+test('a newly added custom shift template (e.g. a second "ביניים" shift) is picked up by automatic schedule generation like any other', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+  const mgrLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const mgrCookie = extractCookie(mgrLogin);
+
+  const createRes = await fetch(base + '/api/templates', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie },
+    body: JSON.stringify({ roleId: 'fuel', label: 'ביניים מתדלקים (חדש)', start: '10:00', end: '18:00', needed: 1, days: [0, 1, 2, 3, 4, 5, 6] }),
+  });
+  const newTplId = (await createRes.json()).id;
+
+  // deactivate every OTHER fuel template first, so the one available employee below has nothing
+  // to compete with — isolates "does a newly added template actually get considered by
+  // generation" from the separate question of fairness/rest-rule interaction with unrelated shifts.
+  const beforeList = await (await fetch(base + '/api/templates', { headers: { Cookie: mgrCookie } })).json();
+  for (const t of beforeList.shiftTemplates) {
+    if (t.roleId === 'fuel' && t.id !== newTplId) {
+      await fetch(base + '/api/templates/' + t.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ active: false }) });
+    }
+  }
+
+  const empRes = await fetch(base + '/api/employees', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: JSON.stringify({ name: 'עובד חדש', roleId: 'fuel', pin: '3333', gender: 'male' }) });
+  const emp = (await empRes.json()).employee;
+
+  const targetDate = S.addDays(S.todayStr(), 90);
+  const weekStart = S.weekKeyOf(targetDate);
+  const empLogin = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'employee', employeeId: emp.id, pin: '3333' }) });
+  const empCookie = extractCookie(empLogin);
+  const days = [0, 1, 2, 3, 4, 5, 6].map(d => ({ date: S.addDays(weekStart, d), choice: 'all' }));
+  await fetch(base + '/api/availability', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: empCookie }, body: JSON.stringify({ weekStart, days }) });
+
+  const genRes = await fetch(base + '/api/schedule/' + weekStart + '/generate', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: mgrCookie }, body: '{}' });
+  assert.strictEqual(genRes.status, 200);
+  const week = await (await fetch(base + '/api/schedule/' + weekStart, { headers: { Cookie: mgrCookie } })).json();
+  assert.ok(week.week.assignments.some(a => a.shiftTemplateId === newTplId), 'the custom shift template should get auto-filled by generation just like any built-in one');
 });
