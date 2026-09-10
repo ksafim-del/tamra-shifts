@@ -501,7 +501,7 @@ function loginHtml() {
   var employeeOptions = (PUBLIC_EMPLOYEES || [])
     .map(function (e) { return '<option value="' + e.id + '">' + esc(e.name) + ' — ' + esc(roleLabel(e.roleId)) + '</option>'; }).join('');
   return '<div class="loginwrap"><div class="loginbox">'
-    + '<h1>לוח משמרות תמרה</h1>'
+    + '<h1>לוח משמרות</h1>'
     + '<div class="seg" style="width:100%;display:flex;margin-bottom:16px;">'
     + '<button type="button" style="flex:1" data-action="seg-mode" data-mode="employee" class="' + (mode === 'employee' ? 'active' : '') + '">כניסת עובד/ת</button>'
     + '<button type="button" style="flex:1" data-action="seg-mode" data-mode="manager" class="' + (mode === 'manager' ? 'active' : '') + '">כניסת מנהל/ת</button>'
