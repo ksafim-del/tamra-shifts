@@ -33,6 +33,16 @@ function roleTeamPhrase(id){ return id==='fuel'?'כל המתדלקים':(id==='s
 function genderLabel(g){ return g==='male'?'זכר':(g==='female'?'נקבה':'לא צוין'); }
 function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-female':'gender-unset'); }
 
+/* ---------- which company is this? ---------- */
+// Each company gets its own URL path on the same deployed app (e.g. /sen-energy) — the same
+// static files are served for all of them, so the company is read from the URL at runtime and
+// sent with every API call. The company that was already using this app before it had others
+// keeps the root path ("/"), which resolves to 'tamra' here to match its slug on the server.
+var COMPANY_SLUG = (function () {
+  var seg = (location.pathname.split('/')[1] || '').toLowerCase();
+  return seg || 'tamra';
+})();
+
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
@@ -41,7 +51,7 @@ var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(t
 
 /* ---------- api ---------- */
 function api(method, path, body) {
-  var opts = { method: method, headers: {} };
+  var opts = { method: method, headers: { 'X-Company-Slug': COMPANY_SLUG } };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   return fetch(path, opts).then(function (res) {
     return res.json().catch(function () { return {}; }).then(function (data) {

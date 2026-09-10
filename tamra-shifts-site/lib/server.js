@@ -10,6 +10,7 @@ const xlsxTruth = require('./xlsx-truth.js');
 const xlsxWriter = require('./xlsx-writer.js');
 const scheduleExport = require('./schedule-export.js');
 const push = require('./push.js');
+const { makeStore, getCompanyBySlug, listCompanies } = require('./store.js');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -52,7 +53,10 @@ function serveStatic(req, res, pathname) {
   const NO_CACHE = 'no-store, no-cache, must-revalidate';
   fs.readFile(full, (err, data) => {
     if (err) {
-      // SPA fallback: unknown non-/api routes serve index.html
+      // SPA fallback: unknown non-/api routes serve index.html. This is also what makes a
+      // company's URL (e.g. /sen-energy) work with zero extra routing: there's no file at that
+      // path, so it falls straight through to the same single-page app, which then figures out
+      // which company it's on from the URL itself (see public/app.js's COMPANY_SLUG).
       fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (err2, data2) => {
         if (err2) { res.writeHead(404); res.end('not found'); return; }
         res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': NO_CACHE });
@@ -66,17 +70,44 @@ function serveStatic(req, res, pathname) {
   });
 }
 
-function makeApp(store, opts) {
+// `db` is the raw database adapter (shared by every company). Each request resolves which
+// company it belongs to — from the X-Company-Slug header before login, from the signed session
+// afterwards — and gets a store scoped to just that company (see store.js's makeStore). Stores
+// are cheap closures over the same `db`, so caching one per company just avoids rebuilding it
+// on every request.
+function makeApp(db, opts) {
   const secret = opts.sessionSecret;
   const secureCookies = !!opts.secureCookies;
   const cronSecret = opts.cronSecret;
+
+  const storeCache = new Map();
+  function storeFor(companyId) {
+    const cid = companyId || 'tamra';
+    if (!storeCache.has(cid)) storeCache.set(cid, makeStore(db, cid));
+    return storeCache.get(cid);
+  }
+  // Pre-login (no session yet): the company comes from the URL the client is on, sent as a
+  // header by public/app.js. An unrecognized/missing slug falls back to 'tamra' — the company
+  // that was already using this app before it had any others, so a stray request never 404s.
+  async function companyIdFromRequest(req) {
+    const slug = String(req.headers['x-company-slug'] || '').trim().toLowerCase();
+    if (!slug) return 'tamra';
+    const company = await getCompanyBySlug(db, slug);
+    return company ? company.id : 'tamra';
+  }
 
   async function requireSession(req) {
     const session = auth.sessionFromRequest(req, secret);
     return session;
   }
+  // A session's companyId is the authoritative source of company scoping once logged in — it's
+  // baked into the signed cookie at login time, so a client can't just change the header to see
+  // another company's data. Old sessions signed before this field existed default to 'tamra'.
+  function storeForSession(session) {
+    return storeFor(session && session.companyId);
+  }
 
-  async function currentEmployee(session) {
+  async function currentEmployee(session, store) {
     if (!session || session.type !== 'employee') return null;
     return store.getEmployee(session.employeeId);
   }
@@ -102,22 +133,25 @@ function makeApp(store, opts) {
   }
 
   route('GET', '/api/public/employees', async (req, res) => {
+    const store = storeFor(await companyIdFromRequest(req));
     const employees = await store.listEmployees();
     return sendJson(res, 200, { employees: employees.filter(e => e.active).map(e => ({ id: e.id, name: e.name, roleId: e.roleId })) });
   });
 
   route('POST', '/api/login', async (req, res, params, body) => {
+    const companyId = await companyIdFromRequest(req);
+    const store = storeFor(companyId);
     if (body.mode === 'manager') {
       const settings = await store.getSettings();
       if (String(body.pin) !== String(settings.managerPin)) return sendJson(res, 401, { error: 'bad_pin' });
-      res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'manager' }, secret, secureCookies));
-      return sendJson(res, 200, { session: { type: 'manager' } });
+      res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'manager', companyId }, secret, secureCookies));
+      return sendJson(res, 200, { session: { type: 'manager', companyId } });
     }
     if (body.mode === 'employee') {
       const emp = await store.getEmployeeByPin(body.employeeId, String(body.pin || ''));
       if (!emp) return sendJson(res, 401, { error: 'bad_pin' });
-      res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'employee', employeeId: emp.id }, secret, secureCookies));
-      return sendJson(res, 200, { session: { type: 'employee', employeeId: emp.id, name: emp.name } });
+      res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'employee', employeeId: emp.id, companyId }, secret, secureCookies));
+      return sendJson(res, 200, { session: { type: 'employee', employeeId: emp.id, name: emp.name, companyId } });
     }
     return sendJson(res, 400, { error: 'bad_mode' });
   });
@@ -130,6 +164,7 @@ function makeApp(store, opts) {
   route('GET', '/api/bootstrap', async (req, res) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const settings = await store.getSettings();
     const employees = await store.listEmployees();
     const shiftTemplates = await store.listShiftTemplates();
@@ -140,7 +175,7 @@ function makeApp(store, opts) {
       shabbatEndDay: settings.shabbatEndDay, shabbatEndTime: settings.shabbatEndTime,
     };
     let me = null;
-    if (session.type === 'employee') { me = await store.getEmployee(session.employeeId); }
+    if (session.type === 'employee') { me = await currentEmployee(session, store); }
     return sendJson(res, 200, { session, me, settings: publicSettings, employees, shiftTemplates, pushPublicKey: push.getPublicKey() });
   });
 
@@ -148,6 +183,7 @@ function makeApp(store, opts) {
   route('POST', '/api/push/subscribe', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const sub = body && body.subscription;
     if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return sendJson(res, 400, { error: 'invalid_subscription' });
     await store.savePushSubscription({
@@ -159,6 +195,7 @@ function makeApp(store, opts) {
   route('POST', '/api/push/unsubscribe', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     if (!body || !body.endpoint) return sendJson(res, 400, { error: 'missing_endpoint' });
     await store.deletePushSubscription(body.endpoint);
     return sendJson(res, 200, { ok: true });
@@ -168,11 +205,13 @@ function makeApp(store, opts) {
   route('GET', '/api/employees', async (req, res) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     return sendJson(res, 200, { employees: await store.listEmployees({ includePin: true }) });
   });
   route('POST', '/api/employees', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     if (!body.name || !body.roleId || !body.pin) return sendJson(res, 400, { error: 'missing_fields' });
     if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
@@ -182,6 +221,7 @@ function makeApp(store, opts) {
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     // Only block switching TO an invalid role; editing other fields on a legacy
     // (e.g. pre-existing office) employee should not be blocked by this.
     if (body.roleId && body.roleId !== 'office' && !VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
@@ -195,17 +235,20 @@ function makeApp(store, opts) {
   route('GET', '/api/templates', async (req, res) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     return sendJson(res, 200, { shiftTemplates: await store.listShiftTemplates() });
   });
   route('POST', '/api/templates', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     const id = await store.createShiftTemplate(body);
     return sendJson(res, 200, { id });
   });
   route('PATCH', '/api/templates/:id', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     await store.updateShiftTemplate(params.id, body);
     return sendJson(res, 200, { ok: true });
   });
@@ -214,6 +257,7 @@ function makeApp(store, opts) {
   route('PATCH', '/api/settings', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     const next = await store.updateSettings(body);
     return sendJson(res, 200, { settings: next });
   });
@@ -222,18 +266,21 @@ function makeApp(store, opts) {
   route('GET', '/api/schedule/:weekStart', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const week = await store.getScheduleWeek(params.weekStart);
     return sendJson(res, 200, { week: week || { weekStart: params.weekStart, assignments: [], understaffed: [], seniorIssues: [], generatedAt: null } });
   });
   route('POST', '/api/schedule/:weekStart/generate', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     const result = await actions.generateWeek(store, params.weekStart, { force: !!(body && body.force) });
     return sendJson(res, 200, result);
   });
   route('GET', '/api/schedule/:weekStart/export.xlsx', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     const [week, templates, employees, settings] = await Promise.all([
       store.getScheduleWeek(params.weekStart), store.listShiftTemplates(), store.listEmployees(), store.getSettings(),
     ]);
@@ -253,6 +300,7 @@ function makeApp(store, opts) {
   route('POST', '/api/schedule/:weekStart/assign', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     const [templates, availRows, employee] = await Promise.all([
       store.listShiftTemplates(), store.listAvailability({ employeeId: body.employeeId, fromDate: body.date, toDate: body.date }), store.getEmployee(body.employeeId),
     ]);
@@ -277,6 +325,7 @@ function makeApp(store, opts) {
   route('DELETE', '/api/assignment/:id', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     await store.removeAssignment(params.id);
     return sendJson(res, 200, { ok: true });
   });
@@ -285,6 +334,7 @@ function makeApp(store, opts) {
   route('POST', '/api/assignment/:id/swap-request', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'employee') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     try {
       const swapId = await actions.openSwapRequest(store, { assignmentId: params.id, requesterId: session.employeeId, kind: body.kind === 'noshow' ? 'noshow' : 'swap' });
       return sendJson(res, 200, { id: swapId });
@@ -293,6 +343,7 @@ function makeApp(store, opts) {
   route('GET', '/api/swaps', async (req, res, params, body, query) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const status = query.get('status') || undefined;
     let swaps = await store.listSwapRequests({ status });
     if (session.type === 'employee') {
@@ -325,6 +376,7 @@ function makeApp(store, opts) {
   route('POST', '/api/swaps/:id/claim', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'employee') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     try {
       await actions.claimSwapRequest(store, { swapId: params.id, claimerId: session.employeeId });
       return sendJson(res, 200, { ok: true });
@@ -333,6 +385,7 @@ function makeApp(store, opts) {
   route('DELETE', '/api/swaps/:id', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'employee') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     try {
       await actions.cancelSwapRequest(store, { swapId: params.id, requesterId: session.employeeId });
       return sendJson(res, 200, { ok: true });
@@ -343,6 +396,7 @@ function makeApp(store, opts) {
   route('GET', '/api/constraints', async (req, res, params, body, query) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     if (session.type === 'manager') {
       const employeeId = query.get('employeeId') || undefined;
       return sendJson(res, 200, { constraints: await store.listConstraints(employeeId) });
@@ -352,6 +406,7 @@ function makeApp(store, opts) {
   route('POST', '/api/constraints', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const employeeId = session.type === 'manager' ? (body.employeeId || null) : session.employeeId;
     if (!employeeId) return sendJson(res, 400, { error: 'missing_employee' });
     if (session.type === 'employee' && body.kind === 'date') {
@@ -366,6 +421,7 @@ function makeApp(store, opts) {
   route('DELETE', '/api/constraints/:id', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const employeeId = session.type === 'employee' ? session.employeeId : null;
     await store.deleteConstraint(params.id, employeeId);
     return sendJson(res, 200, { ok: true });
@@ -376,6 +432,7 @@ function makeApp(store, opts) {
   route('GET', '/api/availability', async (req, res, params, body, query) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const weekStart = query.get('weekStart');
     const fromDate = weekStart || undefined;
     const toDate = weekStart ? S.addDays(weekStart, 6) : undefined;
@@ -385,6 +442,7 @@ function makeApp(store, opts) {
   route('POST', '/api/availability', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const employeeId = session.type === 'manager' ? (body.employeeId || null) : session.employeeId;
     if (!employeeId) return sendJson(res, 400, { error: 'missing_employee' });
     const weekStart = body.weekStart;
@@ -410,6 +468,7 @@ function makeApp(store, opts) {
   route('GET', '/api/hours/:monthKey', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const [assignments, shiftTemplates, settings] = await Promise.all([
       store.listAssignmentsInRange(params.monthKey + '-01', params.monthKey + '-31'),
       store.listShiftTemplates(), store.getSettings(),
@@ -426,6 +485,7 @@ function makeApp(store, opts) {
   route('POST', '/api/hours/truth', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    const store = storeForSession(session);
     if (!body.fileBase64) return sendJson(res, 400, { error: 'missing_file' });
     let buf;
     try { buf = Buffer.from(body.fileBase64, 'base64'); } catch (e) { return sendJson(res, 400, { error: 'invalid_file' }); }
@@ -454,6 +514,7 @@ function makeApp(store, opts) {
   route('GET', '/api/notifications', async (req, res) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     const notifs = session.type === 'manager'
       ? await store.listNotifications({ audience: 'manager' })
       : await store.listNotifications({ audience: 'employee', employeeId: session.employeeId });
@@ -462,23 +523,32 @@ function makeApp(store, opts) {
   route('POST', '/api/notifications/:id/read', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     await store.markNotificationRead(params.id);
     return sendJson(res, 200, { ok: true });
   });
   route('POST', '/api/notifications/read-all', async (req, res) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    const store = storeForSession(session);
     if (session.type === 'manager') await store.markAllNotificationsRead({ audience: 'manager' });
     else await store.markAllNotificationsRead({ audience: 'employee', employeeId: session.employeeId });
     return sendJson(res, 200, { ok: true });
   });
 
-  // ---- cron endpoints (called by Render's scheduled job, not by browsers) ----
+  // ---- cron endpoint (called by Render's scheduled job, not by browsers) ----
+  // Not tied to any one company's session — runs the weekly auto-generation for every company
+  // in one pass, so a single Render Cron Job / scheduled HTTP ping keeps all of them going.
   route('POST', '/api/cron/generate-week', async (req, res, params, body, query) => {
     if (!cronSecret || req.headers['x-cron-secret'] !== cronSecret) return sendJson(res, 403, { error: 'forbidden' });
     const weekStart = S.nextGenerationWeek();
-    const result = await actions.generateWeek(store, weekStart);
-    return sendJson(res, 200, result);
+    const companies = await listCompanies(db);
+    const results = {};
+    for (const c of companies) {
+      const store = storeFor(c.id);
+      results[c.id] = await actions.generateWeek(store, weekStart);
+    }
+    return sendJson(res, 200, { weekStart, results });
   });
 
   return async function handle(req, res) {
@@ -500,8 +570,8 @@ function makeApp(store, opts) {
   };
 }
 
-function createServer(store, opts) {
-  const app = makeApp(store, opts);
+function createServer(db, opts) {
+  const app = makeApp(db, opts);
   return http.createServer(app);
 }
 

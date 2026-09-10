@@ -69,9 +69,10 @@ async function generateWeek(store, weekStart, { force } = {}) {
 
   const settings = meta;
   if (settings.managerEmail) {
-    const subject = result.understaffed.length
+    const companyPrefix = settings.companyName ? ('[' + settings.companyName + '] ') : '';
+    const subject = companyPrefix + (result.understaffed.length
       ? 'לוז שבועי הופק עם משמרות חסרות — ' + weekStart
-      : 'לוז שבועי הופק — ' + weekStart;
+      : 'לוז שבועי הופק — ' + weekStart);
     const body = result.understaffed.length
       ? 'הלוז לשבוע ' + weekStart + ' הופק אוטומטית. יש ' + result.understaffed.length + ' משמרות ללא איוש מלא — יש להיכנס לאתר ולשבץ ידנית.'
       : 'הלוז לשבוע ' + weekStart + ' הופק אוטומטית וכל המשמרות מאוישות.';
@@ -81,7 +82,7 @@ async function generateWeek(store, weekStart, { force } = {}) {
   // Push to every phone with notifications enabled — never lets a push-service hiccup fail
   // the actual schedule generation, which has already been saved above.
   await push.broadcastToAll(store, {
-    title: 'תמרה משמרות',
+    title: settings.companyName ? ('משמרות – ' + settings.companyName) : 'משמרות',
     body: result.understaffed.length
       ? ('הלוז לשבוע ' + weekStart + ' הופק — ' + result.understaffed.length + ' משמרות ללא איוש')
       : ('הלוז לשבוע ' + weekStart + ' הופק בהצלחה, כל המשמרות מאוישות'),
@@ -122,12 +123,13 @@ async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
     channels: peers.length ? ['inapp'] : ['inapp', 'email'],
   });
 
+  const settings = await store.getSettings();
   if (!peers.length) {
-    const settings = await store.getSettings();
     if (settings.managerEmail) {
+      const companyPrefix = settings.companyName ? ('[' + settings.companyName + '] ') : '';
       await mailer.sendMail({
         to: settings.managerEmail,
-        subject: 'דרוש שיבוץ ידני — אין מחליף זמין',
+        subject: companyPrefix + 'דרוש שיבוץ ידני — אין מחליף זמין',
         text: requester.name + ' ' + label + ' משמרת ' + desc + ' ואין עובד/ת אחר/ת פעיל/ה באותו תפקיד. נדרש טיפול ידני.',
       });
     }
@@ -136,7 +138,7 @@ async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
   // Push to every phone with notifications enabled (not just the peers who can take the
   // shift) — the manager especially needs to see this even outside the app.
   await push.broadcastToAll(store, {
-    title: 'תמרה משמרות',
+    title: settings.companyName ? ('משמרות – ' + settings.companyName) : 'משמרות',
     body: requester.name + ' ' + label + ' משמרת: ' + desc,
     tag: 'swap-' + swapId,
     url: '/',

@@ -11,8 +11,8 @@ const { readWorkbook } = require('./xlsx-truth.js');
 async function startTestServer() {
   const db = makeSqliteAdapter(':memory:');
   await initSchema(db);
-  const store = makeStore(db);
-  const server = createServer(store, { sessionSecret: 'test-secret', secureCookies: false, cronSecret: 'cron-test' });
+  const store = makeStore(db); // scoped to the default 'tamra' company — matches every test's plain (no X-Company-Slug header) requests
+  const server = createServer(db, { sessionSecret: 'test-secret', secureCookies: false, cronSecret: 'cron-test' });
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
   return { server, store, base: 'http://127.0.0.1:' + port };
@@ -403,4 +403,48 @@ test('GET /api/swaps attaches potential-replacement candidates to open requests 
   // resolved (non-open) requests don't carry a candidates computation at all
   const closedSwaps = await (await fetch(base + '/api/swaps?status=claimed', { headers: { Cookie: mgrCookie } })).json();
   assert.deepStrictEqual(closedSwaps.swaps.map(s => s.candidates), closedSwaps.swaps.map(() => []));
+});
+
+test('multi-tenant isolation: each company (chosen via X-Company-Slug before login, then remembered in the session) only ever sees its own data', async (t) => {
+  const { server, base } = await startTestServer();
+  t.after(() => server.close());
+
+  const tamraHeaders = { 'Content-Type': 'application/json', 'X-Company-Slug': 'tamra' };
+  const senHeaders = { 'Content-Type': 'application/json', 'X-Company-Slug': 'sen-energy' };
+
+  // both companies start with the same default manager PIN, but are otherwise separate
+  const tamraLogin = await fetch(base + '/api/login', { method: 'POST', headers: tamraHeaders, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const tamraCookie = extractCookie(tamraLogin);
+  const senLogin = await fetch(base + '/api/login', { method: 'POST', headers: senHeaders, body: JSON.stringify({ mode: 'manager', pin: '1234' }) });
+  const senCookie = extractCookie(senLogin);
+  assert.strictEqual(tamraLogin.status, 200);
+  assert.strictEqual(senLogin.status, 200);
+
+  const tamraBoot = await (await fetch(base + '/api/bootstrap', { headers: { Cookie: tamraCookie } })).json();
+  const senBoot = await (await fetch(base + '/api/bootstrap', { headers: { Cookie: senCookie } })).json();
+  assert.strictEqual(tamraBoot.settings.companyName, 'תמרה דלקים (96) בע"מ');
+  assert.strictEqual(senBoot.settings.companyName, 'ס.ע.ן אנרגיה בע"מ');
+  // each company seeds its own copy of the same default shift templates, with different ids
+  assert.strictEqual(tamraBoot.shiftTemplates.length, senBoot.shiftTemplates.length);
+  assert.notStrictEqual(tamraBoot.shiftTemplates[0].id, senBoot.shiftTemplates[0].id);
+
+  // an employee created for תמרה must not show up for ס.ע.ן, even though both use the same
+  // web service and the manager is logged in on both at once
+  const createRes = await fetch(base + '/api/employees', { method: 'POST', headers: { ...tamraHeaders, Cookie: tamraCookie }, body: JSON.stringify({ name: 'עובד תמרה', roleId: 'fuel', pin: '9999' }) });
+  const tamraEmployee = (await createRes.json()).employee;
+
+  const senEmployees = await (await fetch(base + '/api/employees', { headers: { Cookie: senCookie } })).json();
+  assert.ok(!senEmployees.employees.some(e => e.id === tamraEmployee.id), 'sen-energy must not see an employee created for tamra');
+
+  const tamraEmployees = await (await fetch(base + '/api/employees', { headers: { Cookie: tamraCookie } })).json();
+  assert.ok(tamraEmployees.employees.some(e => e.id === tamraEmployee.id));
+
+  // the public (pre-login) employee picker is scoped by the URL's company too
+  const senPublic = await (await fetch(base + '/api/public/employees', { headers: senHeaders })).json();
+  assert.ok(!senPublic.employees.some(e => e.id === tamraEmployee.id));
+
+  // that employee's PIN only works for tamra's login, never for sen-energy's, even though the
+  // employee id itself is technically known
+  const crossLogin = await fetch(base + '/api/login', { method: 'POST', headers: senHeaders, body: JSON.stringify({ mode: 'employee', employeeId: tamraEmployee.id, pin: '9999' }) });
+  assert.strictEqual(crossLogin.status, 401);
 });

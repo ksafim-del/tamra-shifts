@@ -1,7 +1,7 @@
 {
-  "name": "לוח משמרות תמרה",
-  "short_name": "תמרה משמרות",
-  "description": "לוח משמרות ואילוצים — תמרה דלקים (96) בע\"מ",
+  "name": "משמרות",
+  "short_name": "משמרות",
+  "description": "לוח משמרות ואילוצים",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -15,7 +15,7 @@ self.addEventListener('fetch', (event) => { event.respondWith(fetch(event.reques
 self.addEventListener('push', (event) => {
   var data = {};
   try { data = event.data ? event.data.json() : {}; } catch (e) { data = { body: event.data ? event.data.text() : '' }; }
-  var title = data.title || 'תמרה משמרות';
+  var title = data.title || 'משמרות';
   var options = {
     body: data.body || '',
     icon: '/icon-192.png',

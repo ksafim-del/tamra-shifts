@@ -5,7 +5,7 @@
 // browser or Claude session, which is the whole point: it just works, every
 // Thursday, forever.
 const path = require('node:path');
-const { makeStore, initSchema } = require('../lib/store.js');
+const { makeStore, initSchema, listCompanies } = require('../lib/store.js');
 const actions = require('../lib/actions.js');
 const S = require('../lib/schedule.js');
 
@@ -19,10 +19,15 @@ async function main() {
     db = makeSqliteAdapter(path.join(__dirname, '..', 'data', 'tamra.db'));
   }
   await initSchema(db);
-  const store = makeStore(db);
   const weekStart = S.nextGenerationWeek();
-  const result = await actions.generateWeek(store, weekStart);
-  console.log('[cron] generate-week', weekStart, result.skipped ? 'skipped (already generated)' : 'generated, understaffed=' + result.week.understaffed.length);
+  // One database now serves several companies — generate next week's schedule for each of
+  // them in turn, so a single scheduled run keeps every company going.
+  const companies = await listCompanies(db);
+  for (const c of companies) {
+    const store = makeStore(db, c.id);
+    const result = await actions.generateWeek(store, weekStart);
+    console.log('[cron] generate-week', c.id, weekStart, result.skipped ? 'skipped (already generated)' : 'generated, understaffed=' + result.week.understaffed.length);
+  }
   await db.close();
 }
 
