@@ -33,16 +33,6 @@ function roleTeamPhrase(id){ return id==='fuel'?'כל המתדלקים':(id==='s
 function genderLabel(g){ return g==='male'?'זכר':(g==='female'?'נקבה':'לא צוין'); }
 function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-female':'gender-unset'); }
 
-/* ---------- which company is this? ---------- */
-// Each company gets its own URL path on the same deployed app (e.g. /sen-energy) — the same
-// static files are served for all of them, so the company is read from the URL at runtime and
-// sent with every API call. The company that was already using this app before it had others
-// keeps the root path ("/"), which resolves to 'tamra' here to match its slug on the server.
-var COMPANY_SLUG = (function () {
-  var seg = (location.pathname.split('/')[1] || '').toLowerCase();
-  return seg || 'tamra';
-})();
-
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
@@ -51,7 +41,7 @@ var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(t
 
 /* ---------- api ---------- */
 function api(method, path, body) {
-  var opts = { method: method, headers: { 'X-Company-Slug': COMPANY_SLUG } };
+  var opts = { method: method, headers: {} };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   return fetch(path, opts).then(function (res) {
     return res.json().catch(function () { return {}; }).then(function (data) {
@@ -287,6 +277,21 @@ function handleAction(action, el, ev) {
     var emp = (CACHE.employeesFull || []).find(function (e) { return e.id === id; });
     ui.modal = { type: 'employee-form', employee: emp }; render(); return;
   }
+  if (action === 'add-template') { ui.modal = { type: 'template-form' }; render(); return; }
+  if (action === 'edit-template') {
+    var tplId = el.getAttribute('data-id');
+    var tpl = (STATE.shiftTemplates || []).find(function (x) { return x.id === tplId; });
+    ui.modal = { type: 'template-form', template: tpl }; render(); return;
+  }
+  if (action === 'deactivate-template') {
+    var tplId2 = el.getAttribute('data-id');
+    var tpl2 = (STATE.shiftTemplates || []).find(function (x) { return x.id === tplId2; });
+    api('PATCH', '/api/templates/' + tplId2, { active: !(tpl2 && tpl2.active) }).then(function (r) {
+      if (r.ok) { toast('עודכן'); refreshBootstrapEmployees(); } else toast('שגיאה בעדכון', 'err');
+    });
+    return;
+  }
+
   if (action === 'deactivate-employee') {
     var eid = el.getAttribute('data-id');
     var emp2 = (CACHE.employeesFull || []).find(function (e) { return e.id === eid; });
@@ -364,6 +369,18 @@ function handleSubmit(action, form) {
       if (r.status === 409) { toast('המועד האחרון להגשת הזמינות לשבוע זה כבר עבר — יש לפנות להנהלה', 'err'); return; }
       if (!r.ok) { toast('שגיאה', 'err'); return; }
       toast('הזמינות נשלחה', 'ok'); loadAvailability();
+    });
+    return;
+  }
+  if (action === 'submit-template') {
+    var daysArr = f.getAll('days').map(Number);
+    if (!daysArr.length) { toast('יש לבחור לפחות יום אחד', 'err'); return; }
+    var payloadT = { roleId: f.get('roleId'), label: f.get('label'), start: f.get('start'), end: f.get('end'), needed: Number(f.get('needed')), days: daysArr };
+    var editingT = ui.modal && ui.modal.template;
+    var callT = editingT ? api('PATCH', '/api/templates/' + ui.modal.template.id, payloadT) : api('POST', '/api/templates', payloadT);
+    callT.then(function (r) {
+      if (!r.ok) { toast('שגיאה בשמירה — יש לוודא ששעות ההתחלה/סיום וכמות העובדים תקינים', 'err'); return; }
+      toast('נשמר', 'ok'); closeModal(); refreshBootstrapEmployees();
     });
     return;
   }
@@ -501,7 +518,7 @@ function loginHtml() {
   var employeeOptions = (PUBLIC_EMPLOYEES || [])
     .map(function (e) { return '<option value="' + e.id + '">' + esc(e.name) + ' — ' + esc(roleLabel(e.roleId)) + '</option>'; }).join('');
   return '<div class="loginwrap"><div class="loginbox">'
-    + '<h1>לוח משמרות</h1>'
+    + '<h1>לוח משמרות תמרה</h1>'
     + '<div class="seg" style="width:100%;display:flex;margin-bottom:16px;">'
     + '<button type="button" style="flex:1" data-action="seg-mode" data-mode="employee" class="' + (mode === 'employee' ? 'active' : '') + '">כניסת עובד/ת</button>'
     + '<button type="button" style="flex:1" data-action="seg-mode" data-mode="manager" class="' + (mode === 'manager' ? 'active' : '') + '">כניסת מנהל/ת</button>'
@@ -926,7 +943,34 @@ function settingsHtml() {
     + '<h3>לוז שבועי אוטומטי</h3><div class="field"><label>יום הפקת הלוז</label><select name="weeklyGenerationDow">' + [0,1,2,3,4,5,6].map(function(d){return '<option value="'+d+'"'+(d===m.weeklyGenerationDow?' selected':'')+'>'+dowName(d)+'</option>';}).join('') + '</select></div>'
     + '<div class="helpcard">כל יום חמישי בבוקר, השרת מפיק לבד את הלוז לשבוע הבא — לא צריך לבקש את זה. הגשת אילוצים לשבוע נעולה אוטומטית ביום רביעי בלילה שלפניו.</div>'
     + '<button class="btn" type="submit" style="margin-top:14px;">שמירה</button>'
-    + '</form></div>';
+    + '</form></div>'
+    + templatesSettingsHtml();
+}
+
+/* ---------- settings (manager): shift-template structure (hours / headcount / add shift types) ---------- */
+function templatesSettingsHtml() {
+  var all = (STATE.shiftTemplates || []).filter(function (t) { return t.roleId === 'fuel' || t.roleId === 'store'; });
+  var sorted = all.slice().sort(function (a, b) {
+    if (a.roleId !== b.roleId) return a.roleId < b.roleId ? -1 : 1;
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    return timeToMinutes(a.start) - timeToMinutes(b.start);
+  });
+  var rows = sorted.map(function (t) {
+    var daysStr = [0, 1, 2, 3, 4, 5, 6].filter(function (d) { return t.days.indexOf(d) !== -1; }).map(dowName).join(', ');
+    return '<tr>'
+      + '<td><span class="pill ' + roleClass(t.roleId) + '">' + esc(roleLabel(t.roleId)) + '</span></td>'
+      + '<td>' + esc(t.label) + '</td>'
+      + '<td class="mono">' + esc(t.start) + '–' + esc(t.end) + '</td>'
+      + '<td class="mono">' + t.needed + '</td>'
+      + '<td>' + esc(daysStr) + '</td>'
+      + '<td>' + (t.active ? 'פעילה' : '<span style="color:var(--text-dim);">מושבתת</span>') + '</td>'
+      + '<td style="white-space:nowrap;"><button class="iconbtn" data-action="edit-template" data-id="' + t.id + '">עריכה</button> <button class="iconbtn" data-action="deactivate-template" data-id="' + t.id + '">' + (t.active ? 'השבתה' : 'הפעלה') + '</button></td>'
+      + '</tr>';
+  }).join('');
+  return '<div class="card"><div class="card-head"><h2>משמרות</h2><button class="btn" data-action="add-template">+ הוספת משמרת</button></div>'
+    + '<div class="helpcard">כאן אפשר לשנות את שעות כל משמרת ואת כמות העובדים הדרושה בה, ולהוסיף סוגי משמרות חדשים — למשל משמרת "ביניים" נוספת. משמרת מושבתת לא תיכלל בהפקה האוטומטית של הלוז הבא, אבל שיבוצים קודמים שלה נשארים בהיסטוריה כרגיל.</div>'
+    + (rows ? ('<table class="xltable"><thead><tr><th>תפקיד</th><th>שם המשמרת</th><th>שעות</th><th>כמות נדרשת</th><th>ימים</th><th>סטטוס</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>') : '<div class="empty">אין משמרות מוגדרות</div>')
+    + '</div>';
 }
 
 /* ---------- employee: my schedule ---------- */
@@ -1104,6 +1148,20 @@ function modalHtml() {
       + '<div class="field"><label>קוד PIN אישי</label><input name="pin" pattern="[0-9]{4,6}" required value="' + (e ? esc(e.pin||'') : '') + '"></div>'
       + '<div class="field"><label>מגדר</label><select name="gender" required><option value="">בחר/י</option><option value="male"' + (e && e.gender==='male'?' selected':'') + '>זכר</option><option value="female"' + (e && e.gender==='female'?' selected':'') + '>נקבה</option></select></div>'
       + '<div class="field"><label><input type="checkbox" name="isSenior" style="width:auto;display:inline-block;"' + (e && e.isSeniorManual ? ' checked' : '') + '> מתדלק/ת ותיק/ה <span style="font-weight:400;color:var(--text-dim);">(רלוונטי למתדלקים בלבד — בכל משמרת מתדלקים חייב להיות משובץ לפחות מתדלק/ת ותיק/ה אחד/ת. כל מתדלק/ת מקבל/ת ותק אוטומטית אחרי חודשיים במערכת — אפשר גם לסמן ידנית מוקדם יותר)</span></label></div>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
+      + '</form>';
+  } else if (m.type === 'template-form') {
+    var tf = m.template;
+    var tfDays = tf ? tf.days : [0, 1, 2, 3, 4, 5, 6];
+    inner = '<h3>' + (tf ? 'עריכת משמרת' : 'הוספת משמרת') + '</h3><form data-action="submit-template">'
+      + '<div class="field"><label>תפקיד</label><select name="roleId"><option value="fuel"' + (tf ? (tf.roleId === 'fuel' ? ' selected' : '') : ' selected') + '>מתדלקים</option><option value="store"' + (tf && tf.roleId === 'store' ? ' selected' : '') + '>עובדי חנות</option></select></div>'
+      + '<div class="field"><label>שם המשמרת</label><input name="label" required value="' + (tf ? esc(tf.label) : '') + '" placeholder="למשל: ביניים מתדלקים"></div>'
+      + '<div class="field-row"><div class="field"><label>שעת התחלה</label><input type="time" name="start" required value="' + (tf ? esc(tf.start) : '') + '"></div>'
+      + '<div class="field"><label>שעת סיום</label><input type="time" name="end" required value="' + (tf ? esc(tf.end) : '') + '"></div>'
+      + '<div class="field"><label>כמות עובדים נדרשת</label><input type="number" name="needed" min="1" required value="' + (tf ? tf.needed : 1) + '"></div></div>'
+      + '<div class="field"><label>ימים שהמשמרת רצה בהם</label><div style="display:flex;gap:10px;flex-wrap:wrap;">' + [0, 1, 2, 3, 4, 5, 6].map(function (d) {
+          return '<label style="display:flex;align-items:center;gap:4px;font-weight:400;"><input type="checkbox" name="days" value="' + d + '" style="width:auto;"' + (tfDays.indexOf(d) !== -1 ? ' checked' : '') + '> ' + dowName(d) + '</label>';
+        }).join('') + '</div></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
   } else if (m.type === 'confirm-swap') {
