@@ -2,7 +2,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { makeSqliteAdapter } = require('./lib/db-sqlite.js');
-const { initSchema } = require('./lib/store.js');
+const { initSchema, makeStore } = require('./lib/store.js');
 const { createServer } = require('./lib/server.js');
 
 async function main() {
@@ -26,8 +26,9 @@ async function main() {
     console.log('[db] using local SQLite at', path.join(dataDir, 'tamra.db'));
   }
   await initSchema(db);
+  const store = makeStore(db);
 
-  const server = createServer(db, {
+  const server = createServer(store, {
     sessionSecret,
     secureCookies: isProd,
     cronSecret,
