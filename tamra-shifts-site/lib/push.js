@@ -35,18 +35,22 @@ async function sendToSubscription(subscription, payload) {
 }
 
 // Sends `payload` (a plain object — public/sw.js's 'push' handler expects
-// { title, body, tag?, url? }) to every stored subscription. A subscription the push
-// service reports as gone (404/410 — the user uninstalled the app, cleared data, or
-// revoked the permission) is deleted so it stops being retried forever. `opts.sendOne`
-// lets tests exercise this broadcast/pruning logic without the real 'web-push' package.
-async function broadcastToAll(store, payload, opts) {
+// { title, body, tag?, url? }) to every subscription row matching `filterFn(row)` — each row
+// has { endpoint, p256dh, auth, subject_type: 'manager'|'employee', subject_id } (subject_id is
+// the employee's id, null for a manager's own subscription; see store.savePushSubscription). A
+// subscription the push service reports as gone (404/410 — the user uninstalled the app,
+// cleared data, or revoked the permission) is deleted so it stops being retried forever.
+// `opts.sendOne` lets tests exercise this broadcast/pruning logic without the real 'web-push'
+// package.
+async function broadcastTo(store, payload, filterFn, opts) {
   opts = opts || {};
   if (!isConfigured()) {
     console.log('[push] VAPID not configured, skipping broadcast:', payload && payload.title);
     return { attempted: 0, sent: 0, pruned: 0, reason: 'not_configured' };
   }
   const send = opts.sendOne || sendToSubscription;
-  const rows = await store.listPushSubscriptions();
+  const allRows = await store.listPushSubscriptions();
+  const rows = filterFn ? allRows.filter(filterFn) : allRows;
   if (!rows.length) return { attempted: 0, sent: 0, pruned: 0 };
   let sent = 0, pruned = 0;
   await Promise.all(rows.map(async (row) => {
@@ -67,4 +71,10 @@ async function broadcastToAll(store, payload, opts) {
   return { attempted: rows.length, sent, pruned };
 }
 
-module.exports = { isConfigured, getPublicKey, sendToSubscription, broadcastToAll };
+// Sends to every stored subscription, regardless of who it belongs to — used for the
+// schedule-generated and understaffed-shift alerts, which are meant for everyone with the app.
+async function broadcastToAll(store, payload, opts) {
+  return broadcastTo(store, payload, null, opts);
+}
+
+module.exports = { isConfigured, getPublicKey, sendToSubscription, broadcastToAll, broadcastTo };
