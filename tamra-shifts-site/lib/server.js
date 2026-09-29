@@ -73,9 +73,81 @@ function makeApp(store, opts) {
   const secureCookies = !!opts.secureCookies;
   const cronSecret = opts.cronSecret;
 
+  // An employee's session cookie stays valid for 30 days — but if the manager deactivates
+  // (or deletes) that employee in the meantime, their access must end right away, not whenever
+  // the cookie happens to expire.
   async function requireSession(req) {
     const session = auth.sessionFromRequest(req, secret);
+    if (session && session.type === 'employee') {
+      const emp = await store.getEmployee(session.employeeId);
+      if (!emp || !emp.active) return null;
+    }
     return session;
+  }
+
+  // ---- brute-force protection for the PIN login ----
+  // PINs are short (4-6 digits), so without a limit anyone could simply try them all. After
+  // LOGIN_MAX_FAILS wrong PINs for the same account from the same address within
+  // LOGIN_WINDOW_MS, further attempts are refused until the window passes. In-memory is enough
+  // here: a single small instance, and a restart only ever makes it more lenient.
+  // Two counters per attempt: one per (address + account), and one per account regardless of
+  // address (a higher limit), so switching addresses doesn't give an attacker unlimited tries.
+  const LOGIN_MAX_FAILS = 8;
+  const LOGIN_MAX_FAILS_ANY_IP = 25;
+  const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+  const loginFails = new Map();
+  // Render's proxy appends the real client address as the LAST X-Forwarded-For entry; earlier
+  // entries come from the client itself and can't be trusted.
+  function clientIp(req) {
+    const fwd = req.headers['x-forwarded-for'];
+    if (fwd) { const parts = String(fwd).split(',').map(x => x.trim()).filter(Boolean); if (parts.length) return parts[parts.length - 1]; }
+    return (req.socket && req.socket.remoteAddress) || '';
+  }
+  function loginKeys(req, body) {
+    const account = body.mode === 'manager' ? 'manager' : 'emp:' + String(body.employeeId || '').slice(0, 64);
+    return [{ key: clientIp(req) + '|' + account, max: LOGIN_MAX_FAILS }, { key: '*|' + account, max: LOGIN_MAX_FAILS_ANY_IP }];
+  }
+  function failEntry(key) {
+    const e = loginFails.get(key);
+    if (e && Date.now() - e.first > LOGIN_WINDOW_MS) { loginFails.delete(key); return null; }
+    return e || null;
+  }
+  function loginBlocked(keys) { return keys.some(k => { const e = failEntry(k.key); return !!e && e.count >= k.max; }); }
+  function loginFailed(keys) {
+    keys.forEach(k => {
+      const e = failEntry(k.key);
+      if (e) e.count++; else loginFails.set(k.key, { first: Date.now(), count: 1 });
+    });
+    if (loginFails.size > 5000) { // keep memory bounded: drop expired entries, then the oldest
+      for (const key of Array.from(loginFails.keys())) failEntry(key);
+      for (const key of Array.from(loginFails.keys())) { if (loginFails.size <= 4000) break; loginFails.delete(key); }
+    }
+  }
+  function loginSucceeded(keys) { keys.forEach(k => loginFails.delete(k.key)); }
+
+  // ---- automatic weekly generation ----
+  // There's no always-on scheduler on this hosting plan (the free web service sleeps when idle,
+  // and no separate cron job is set up), so instead: once the availability deadline for next
+  // week has passed (Wednesday 23:59 by default), the first visit to the site generates next
+  // week's schedule if nobody has generated it (or started assigning it by hand) yet. The
+  // manager can still "הפק מחדש" afterwards, and can turn this off in the settings.
+  const autoGenerateEnabled = !!opts.autoGenerate;
+  let autoGenLastCheck = 0;
+  let autoGenRunning = null;
+  function maybeAutoGenerate() {
+    if (!autoGenerateEnabled || autoGenRunning) return autoGenRunning;
+    if (Date.now() - autoGenLastCheck < 5 * 60 * 1000) return null;
+    autoGenLastCheck = Date.now();
+    autoGenRunning = (async () => {
+      const settings = await store.getSettings();
+      if (settings.autoGenerate === false) return;
+      const target = S.nextGenerationWeek();
+      if (!S.constraintDeadlinePassed(target, settings.weeklyGenerationDow)) return;
+      if (await store.getScheduleWeek(target)) return; // already generated, or being built by hand
+      const result = await actions.generateWeek(store, target);
+      console.log('[auto-generate] week', target, result.skipped ? 'skipped' : ('generated, understaffed=' + result.week.understaffed.length));
+    })().catch((err) => console.error('[auto-generate] failed:', err && err.message)).finally(() => { autoGenRunning = null; });
+    return autoGenRunning;
   }
 
   async function currentEmployee(session) {
@@ -109,15 +181,22 @@ function makeApp(store, opts) {
   });
 
   route('POST', '/api/login', async (req, res, params, body) => {
+    const keys = loginKeys(req, body);
+    if (loginBlocked(keys)) return sendJson(res, 429, { error: 'too_many_attempts' });
     if (body.mode === 'manager') {
       const settings = await store.getSettings();
-      if (String(body.pin) !== String(settings.managerPin)) return sendJson(res, 401, { error: 'bad_pin' });
+      if (String(body.pin) !== String(settings.managerPin)) { loginFailed(keys); return sendJson(res, 401, { error: 'bad_pin' }); }
+      loginSucceeded(keys);
       res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'manager' }, secret, secureCookies));
       return sendJson(res, 200, { session: { type: 'manager' } });
     }
     if (body.mode === 'employee') {
       const emp = await store.getEmployeeByPin(body.employeeId, String(body.pin || ''));
-      if (!emp) return sendJson(res, 401, { error: 'bad_pin' });
+      if (!emp) {
+        if (await store.getEmployee(String(body.employeeId || ''))) loginFailed(keys); // only count real accounts
+        return sendJson(res, 401, { error: 'bad_pin' });
+      }
+      loginSucceeded(keys);
       res.setHeader('Set-Cookie', auth.makeSessionCookie({ type: 'employee', employeeId: emp.id }, secret, secureCookies));
       return sendJson(res, 200, { session: { type: 'employee', employeeId: emp.id, name: emp.name } });
     }
@@ -132,6 +211,10 @@ function makeApp(store, opts) {
   route('GET', '/api/bootstrap', async (req, res) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
+    // Usually an instant no-op (see above). When it does generate, wait a few seconds so this
+    // visitor already sees the new week — but never hold the page hostage to a slow email/push.
+    const gen = maybeAutoGenerate();
+    if (gen) await Promise.race([gen, new Promise(r => setTimeout(r, 4000))]);
     const settings = await store.getSettings();
     const employees = await store.listEmployees();
     const shiftTemplates = await store.listShiftTemplates();
@@ -190,6 +273,8 @@ function makeApp(store, opts) {
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
     const emp = await store.updateEmployee(params.id, body);
     if (!emp) return sendJson(res, 404, { error: 'not_found' });
+    // A deactivated employee's phones stop getting this company's notifications.
+    if (body.active === false) await store.deletePushSubscriptionsForEmployee(emp.id);
     return sendJson(res, 200, { employee: emp });
   });
 
@@ -273,35 +358,30 @@ function makeApp(store, opts) {
     });
     res.end(buffer);
   });
+  // Manual add/remove by the manager — see actions.manualAssign/manualRemove, which also
+  // notify the affected employee.
   route('POST', '/api/schedule/:weekStart/assign', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
-    const [templates, availRows, employee] = await Promise.all([
-      store.listShiftTemplates(), store.listAvailability({ employeeId: body.employeeId, fromDate: body.date, toDate: body.date }), store.getEmployee(body.employeeId),
-    ]);
-    const template = templates.find(t => t.id === body.shiftTemplateId);
-    let constraintConflict = false;
-    if (template) {
-      const bucket = S.timeBucketOf(template);
-      const choice = availRows.length ? availRows[0].choice : 'all'; // no submission yet => treated as available
-      constraintConflict = !S.isAvailableForShift(choice, bucket);
+    try {
+      const result = await actions.manualAssign(store, { weekStart: params.weekStart, date: body.date, shiftTemplateId: body.shiftTemplateId, employeeId: body.employeeId });
+      return sendJson(res, 200, result);
+    } catch (e) {
+      if (e.message === 'already_assigned') return sendJson(res, 409, { error: e.message });
+      if (['invalid_date', 'invalid_template', 'invalid_employee'].includes(e.message)) return sendJson(res, 400, { error: e.message });
+      throw e;
     }
-    const id = await store.addAssignment(params.weekStart, body.date, body.shiftTemplateId, body.employeeId);
-    if (constraintConflict) {
-      const desc = (template.label + ' ' + body.date + ' (' + template.start + '-' + template.end + ')');
-      await store.addNotification({
-        audience: 'manager', type: 'constraint-conflict', relatedId: id,
-        text: 'שובץ/ה ' + (employee ? employee.name : 'עובד/ת') + ' למשמרת ' + desc + ' בניגוד לזמינות שהגיש/ה.',
-        severity: 'warning', channels: ['inapp'],
-      });
-    }
-    return sendJson(res, 200, { id, constraintConflict });
   });
   route('DELETE', '/api/assignment/:id', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
-    await store.removeAssignment(params.id);
-    return sendJson(res, 200, { ok: true });
+    try {
+      const result = await actions.manualRemove(store, params.id);
+      return sendJson(res, 200, Object.assign({ ok: true }, result));
+    } catch (e) {
+      if (e.message === 'not_found') return sendJson(res, 404, { error: e.message });
+      throw e;
+    }
   });
 
   // ---- swap / no-show flow ----
@@ -485,14 +565,15 @@ function makeApp(store, opts) {
   route('POST', '/api/notifications/:id/read', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
-    await store.markNotificationRead(params.id);
+    await store.markNotificationRead(params.id, session.type === 'manager' ? { audience: 'manager' } : { audience: 'employee', employeeId: session.employeeId });
     return sendJson(res, 200, { ok: true });
   });
-  route('POST', '/api/notifications/read-all', async (req, res) => {
+  route('POST', '/api/notifications/read-all', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
-    if (session.type === 'manager') await store.markAllNotificationsRead({ audience: 'manager' });
-    else await store.markAllNotificationsRead({ audience: 'employee', employeeId: session.employeeId });
+    const upTo = Number(body && body.upTo) || undefined;
+    if (session.type === 'manager') await store.markAllNotificationsRead({ audience: 'manager', upTo });
+    else await store.markAllNotificationsRead({ audience: 'employee', employeeId: session.employeeId, upTo });
     return sendJson(res, 200, { ok: true });
   });
 
