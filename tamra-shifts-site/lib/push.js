@@ -1,5 +1,5 @@
 'use strict';
-// Web Push notifications — broadcasts a short alert to every phone that has enabled
+// Web Push notifications — sends a short alert to the phones that have enabled
 // notifications for the installed app (see public/app.js's push-subscribe flow and
 // public/sw.js's 'push' handler). Same "optional, safe no-op if unconfigured" shape as
 // mailer.js: if the three PUSH_VAPID_* env vars aren't set, every call here just logs and
@@ -34,6 +34,11 @@ async function sendToSubscription(subscription, payload) {
   await webpush().sendNotification(subscription, JSON.stringify(payload));
 }
 
+// Lets tests capture every push the business actions (lib/actions.js) send, without the real
+// 'web-push' package or network — pass null to restore normal sending.
+let testSender = null;
+function setTestSender(fn) { testSender = fn; }
+
 // Sends `payload` (a plain object — public/sw.js's 'push' handler expects
 // { title, body, tag?, url? }) to every subscription row matching `filterFn(row)` — each row
 // has { endpoint, p256dh, auth, subject_type: 'manager'|'employee', subject_id } (subject_id is
@@ -48,10 +53,15 @@ async function broadcastTo(store, payload, filterFn, opts) {
     console.log('[push] VAPID not configured, skipping broadcast:', payload && payload.title);
     return { attempted: 0, sent: 0, pruned: 0, reason: 'not_configured' };
   }
-  const send = opts.sendOne || sendToSubscription;
+  const send = opts.sendOne || testSender || sendToSubscription;
   const allRows = await store.listPushSubscriptions();
   const rows = filterFn ? allRows.filter(filterFn) : allRows;
-  if (!rows.length) return { attempted: 0, sent: 0, pruned: 0 };
+  if (!rows.length) {
+    // Logged so "why didn't X get a notification?" can be answered from the server logs: this
+    // almost always means that person never turned on notifications (the bell) on their phone.
+    if (!opts.quiet) console.log('[push] no subscribed devices for', (payload && payload.tag) || 'broadcast', '(' + allRows.length + ' devices total)');
+    return { attempted: 0, sent: 0, pruned: 0 };
+  }
   let sent = 0, pruned = 0;
   await Promise.all(rows.map(async (row) => {
     const subscription = { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } };
@@ -68,13 +78,23 @@ async function broadcastTo(store, payload, filterFn, opts) {
       }
     }
   }));
+  if (!opts.quiet) console.log('[push] sent', (payload && payload.tag) || 'broadcast', '→', sent + '/' + rows.length, 'devices' + (pruned ? (', pruned ' + pruned + ' expired') : ''));
   return { attempted: rows.length, sent, pruned };
 }
 
-// Sends to every stored subscription, regardless of who it belongs to — used for the
-// schedule-generated and understaffed-shift alerts, which are meant for everyone with the app.
+// Filter helpers for broadcastTo — who a subscription row belongs to (see store.savePushSubscription).
+function toManagers() {
+  return (row) => row.subject_type === 'manager';
+}
+function toEmployees(employeeIds) {
+  const ids = new Set((employeeIds || []).map(String));
+  return (row) => row.subject_type === 'employee' && ids.has(String(row.subject_id));
+}
+
+// Sends to every stored subscription, regardless of who it belongs to. The business actions
+// now always target specific people via broadcastTo; this stays for backward compatibility.
 async function broadcastToAll(store, payload, opts) {
   return broadcastTo(store, payload, null, opts);
 }
 
-module.exports = { isConfigured, getPublicKey, sendToSubscription, broadcastToAll, broadcastTo };
+module.exports = { isConfigured, getPublicKey, sendToSubscription, broadcastToAll, broadcastTo, toManagers, toEmployees, setTestSender };
