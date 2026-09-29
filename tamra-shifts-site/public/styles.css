@@ -221,3 +221,13 @@ table.xltable tr.subrow .subrow-label { font-weight: 700; color: var(--text); }
 
   .toastzone { bottom: calc(84px + env(safe-area-inset-bottom)); }
 }
+
+/* unread-notifications badge on the התראות / בקשות tab */
+.tabbar button .tab-ic { position: relative; display: inline-block; }
+.tab-badge { position: absolute; top: -7px; inset-inline-end: -12px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--err); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; font-family: var(--font-ui); box-shadow: 0 0 0 2px var(--surface); }
+.tab-badge[hidden] { display: none; }
+
+/* "turn on phone notifications" invitation */
+.push-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #fdf0e3; color: var(--accent-ink); border: 1px solid #f3d2b3; margin-top: 12px; }
+.push-banner .iconbtn { flex-shrink: 0; }
+@media (max-width: 640px) { .push-banner { flex-direction: column; align-items: stretch; } }
