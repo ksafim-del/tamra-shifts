@@ -1,4 +1,8 @@
 'use strict';
+// All the scheduling logic works in local wall-clock time (a shift is "Sunday 05:00", the
+// availability deadline is "Wednesday 23:59") — so the server has to run on Israel time, not the
+// hosting provider's UTC. Must be set before anything below creates a Date.
+if (!process.env.TZ) process.env.TZ = 'Asia/Jerusalem';
 const path = require('node:path');
 const fs = require('node:fs');
 const { makeSqliteAdapter } = require('./lib/db-sqlite.js');
@@ -32,6 +36,7 @@ async function main() {
     sessionSecret,
     secureCookies: isProd,
     cronSecret,
+    autoGenerate: true,
   });
   server.listen(port, () => {
     console.log('תמרה משמרות — listening on port ' + port);
