@@ -119,8 +119,8 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_audience ON notifications(audience, employee_id);
 -- One row per browser/device that has enabled push notifications (public/app.js's
 -- push-subscribe flow). Keyed by endpoint (unique per browser+device+site) rather than by
--- employee, so the same login on two phones just makes two rows — broadcasts (lib/push.js)
--- send to every row regardless of who it belongs to.
+-- employee, so the same login on two phones just makes two rows. subject_type/subject_id record
+-- who is logged in on that device, so lib/push.js can target just the right people.
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   id TEXT PRIMARY KEY,
   company_id TEXT NOT NULL DEFAULT 'tamra',
@@ -674,6 +674,14 @@ function makeStore(db, companyId) {
       const row = await db.get("SELECT * FROM swap_requests WHERE company_id = ? AND assignment_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1", [cid, assignmentId]);
       return row ? rowToSwap(row) : null;
     },
+    // Atomically moves an OPEN request to 'claimed' — the WHERE status='open' guard means that if
+    // two colleagues tap "I'll take it" at the same moment, exactly one wins (returns true) and
+    // the other gets false, instead of both being handed the shift.
+    async claimOpenSwapRequest(id, claimedBy) {
+      const r = await db.run("UPDATE swap_requests SET status = 'claimed', claimed_by = ?, resolved_at = ? WHERE id = ? AND company_id = ? AND status = 'open'",
+        [claimedBy, Date.now(), id, cid]);
+      return Number(r && r.changes) === 1;
+    },
     async updateSwapRequest(id, patch) {
       const cur = await db.get('SELECT * FROM swap_requests WHERE id = ? AND company_id = ?', [id, cid]);
       if (!cur) return null;
@@ -688,6 +696,24 @@ function makeStore(db, companyId) {
     async deleteSwapRequest(id, requesterId) {
       if (requesterId) return db.run('DELETE FROM swap_requests WHERE id = ? AND requester_id = ? AND company_id = ?', [id, requesterId, cid]);
       return db.run('DELETE FROM swap_requests WHERE id = ? AND company_id = ?', [id, cid]);
+    },
+    // An open swap request points at one assignment row. When that row disappears (the manager
+    // removed it by hand, or regenerated the week), the request can never be claimed anymore —
+    // these drop such requests so nobody keeps seeing a "take this shift" offer that would only
+    // fail. Returns the ids that were removed, so their notifications can be cleaned up too.
+    async deleteOpenSwapsForAssignment(assignmentId) {
+      const rows = await db.all("SELECT id FROM swap_requests WHERE company_id = ? AND assignment_id = ? AND status = 'open'", [cid, assignmentId]);
+      for (const r of rows) await db.run('DELETE FROM swap_requests WHERE id = ? AND company_id = ?', [r.id, cid]);
+      return rows.map(r => r.id);
+    },
+    async deleteOpenSwapsInRange(fromDate, toDate) {
+      // Also catches open requests whose shift no longer exists at all — including old rows from
+      // before swap_requests.date was recorded (date is NULL there, so the range can't match them).
+      const rows = await db.all(
+        "SELECT id FROM swap_requests WHERE company_id = ? AND status = 'open' AND ((date >= ? AND date <= ?) OR assignment_id NOT IN (SELECT id FROM assignments WHERE company_id = ?))",
+        [cid, fromDate, toDate, cid]);
+      for (const r of rows) await db.run('DELETE FROM swap_requests WHERE id = ? AND company_id = ?', [r.id, cid]);
+      return rows.map(r => r.id);
     },
 
     async addNotification(n) {
@@ -714,14 +740,39 @@ function makeStore(db, companyId) {
       }
       return rows.map(rowToNotification);
     },
-    async markNotificationRead(id) { await db.run('UPDATE notifications SET read = 1 WHERE id = ? AND company_id = ?', [id, cid]); },
-    async markAllNotificationsRead({ audience, employeeId } = {}) {
+    // Removes notifications matching every given field (all optional except at least one) —
+    // used to retract notifications that no longer apply, e.g. the "X is asking for a swap, you
+    // can take it" offers once that swap was claimed or cancelled, or last week's
+    // "your schedule is out" note when the same week is regenerated.
+    async deleteNotifications({ audience, type, relatedId, employeeId } = {}) {
+      let sql = 'DELETE FROM notifications WHERE company_id = ?';
+      const args = [cid];
+      if (audience) { sql += ' AND audience = ?'; args.push(audience); }
+      if (type) { sql += ' AND type = ?'; args.push(type); }
+      if (relatedId) { sql += ' AND related_id = ?'; args.push(relatedId); }
+      if (employeeId) { sql += ' AND employee_id = ?'; args.push(employeeId); }
+      if (args.length === 1) throw new Error('deleteNotifications needs at least one filter');
+      await db.run(sql, args);
+    },
+    // `scope` ({ audience, employeeId }) limits the update to the caller's own notifications, so
+    // one user can't mark someone else's as read by guessing an id.
+    async markNotificationRead(id, scope) {
+      let sql = 'UPDATE notifications SET read = 1 WHERE id = ? AND company_id = ?';
+      const args = [id, cid];
+      if (scope && scope.audience) { sql += ' AND audience = ?'; args.push(scope.audience); }
+      if (scope && scope.employeeId) { sql += ' AND employee_id = ?'; args.push(scope.employeeId); }
+      await db.run(sql, args);
+    },
+    // `upTo` (ms timestamp, optional): only notifications created at or before it — so "mark all
+    // read" never swallows one that arrived after the list the person was actually looking at.
+    async markAllNotificationsRead({ audience, employeeId, upTo } = {}) {
+      const until = Number.isFinite(upTo) ? ' AND created_at <= ' + Math.floor(upTo) : '';
       if (audience === 'employee' && employeeId) {
-        await db.run("UPDATE notifications SET read = 1 WHERE company_id = ? AND audience = 'employee' AND employee_id = ? AND read = 0", [cid, employeeId]);
+        await db.run("UPDATE notifications SET read = 1 WHERE company_id = ? AND audience = 'employee' AND employee_id = ? AND read = 0" + until, [cid, employeeId]);
       } else if (audience) {
-        await db.run('UPDATE notifications SET read = 1 WHERE company_id = ? AND audience = ? AND read = 0', [cid, audience]);
+        await db.run('UPDATE notifications SET read = 1 WHERE company_id = ? AND audience = ? AND read = 0' + until, [cid, audience]);
       } else {
-        await db.run('UPDATE notifications SET read = 1 WHERE company_id = ? AND read = 0', [cid]);
+        await db.run('UPDATE notifications SET read = 1 WHERE company_id = ? AND read = 0' + until, [cid]);
       }
     },
 
@@ -743,6 +794,10 @@ function makeStore(db, companyId) {
       await db.run('INSERT INTO push_subscriptions (id, company_id, endpoint, p256dh, auth, subject_type, subject_id, created_at) VALUES (?,?,?,?,?,?,?,?)',
         [id, cid, sub.endpoint, sub.p256dh, sub.auth, sub.subjectType, sub.subjectId || null, Date.now()]);
       return id;
+    },
+    // Detaches every device of one employee (used when the manager deactivates them).
+    async deletePushSubscriptionsForEmployee(employeeId) {
+      await db.run("DELETE FROM push_subscriptions WHERE company_id = ? AND subject_type = 'employee' AND subject_id = ?", [cid, employeeId]);
     },
     async deletePushSubscription(endpoint) {
       await db.run('DELETE FROM push_subscriptions WHERE endpoint = ? AND company_id = ?', [endpoint, cid]);
