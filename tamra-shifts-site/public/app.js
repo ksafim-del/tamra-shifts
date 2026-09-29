@@ -12,7 +12,9 @@ function addMonths(mk,delta){ var p=mk.split('-').map(Number); var d=new Date(p[
 function monthKeyOf(d){ return d.getFullYear()+'-'+pad2(d.getMonth()+1); }
 function monthLabel(mk){ var p=mk.split('-'); var names=['ינואר','פברואר','מרץ','אפריל','מאי','יוני','יולי','אוגוסט','ספטמבר','אוקטובר','נובמבר','דצמבר']; return names[Number(p[1])-1]+' '+p[0]; }
 function fmtDateShort(ds){ var p=ds.split('-'); return p[2]+'.'+p[1]; }
-function weekLabel(wk){ var end=addDays(wk,6); return fmtDateShort(wk)+'–'+fmtDateShort(end)+'.'+wk.split('-')[0]; }
+// Wrapped in a left-to-right isolate (U+2066…U+2069) so the date range isn't flipped around by
+// the surrounding right-to-left Hebrew text ("27.09–03.10.2026", not "03.10.2026–27.09").
+function weekLabel(wk){ var end=addDays(wk,6); return '\u2066'+fmtDateShort(wk)+'–'+fmtDateShort(end)+'.'+wk.split('-')[0]+'\u2069'; }
 function dowName(n){ return ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'][n]; }
 function dowOfDateStr(ds){ var p=ds.split('-').map(Number); return new Date(p[0],p[1]-1,p[2]).getDay(); }
 function dayDateHtml(ds){ if(!ds) return '—'; return '<b>' + dowName(dowOfDateStr(ds)) + '</b> <span class="mono">' + fmtDateShort(ds) + '</span>'; }
@@ -37,13 +39,25 @@ function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-f
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
 var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine', pushSupported:null, pushSubscribed:false, pushBusy:false };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine', pushSupported:null, pushSubscribed:false, pushBusy:false, pushPermission:null };
+var SEEN_NOTIF_IDS = null; // ids already known to this tab — anything new after the first load gets a toast
+
+// Tabs that exist per session type (also used to validate a ?tab= link from a push notification).
+var MANAGER_TABS = ['overview', 'schedule', 'employees', 'requests', 'hours', 'settings'];
+var EMPLOYEE_TABS = ['myschedule', 'myavailability', 'myswaps', 'myhours', 'mynotifs'];
+
+// Small localStorage helpers — storage can be unavailable (private mode etc.), never let that break the app.
+function lsGet(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { window.localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
 
 /* ---------- api ---------- */
 function api(method, path, body) {
   var opts = { method: method, headers: {} };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   return fetch(path, opts).then(function (res) {
+    // The session ended server-side (expired, or the manager deactivated this employee) —
+    // go back to the login screen instead of leaving a half-working app on screen.
+    if (res.status === 401 && STATE && path !== '/api/login') { resetClientState(); boot(); }
     return res.json().catch(function () { return {}; }).then(function (data) {
       return { ok: res.status >= 200 && res.status < 300, status: res.status, data: data };
     });
@@ -68,10 +82,23 @@ function boot() {
       return;
     }
     STATE = r.data;
-    if (!ui.tab) ui.tab = STATE.session.type === 'manager' ? 'overview' : 'myschedule';
+    var allowed = STATE.session.type === 'manager' ? MANAGER_TABS : EMPLOYEE_TABS;
+    var linkTab = tabFromUrl();
+    if (linkTab && allowed.indexOf(linkTab) !== -1) ui.tab = linkTab;
+    if (!ui.tab || allowed.indexOf(ui.tab) === -1) ui.tab = STATE.session.type === 'manager' ? 'overview' : 'myschedule';
     render();
     refreshPushState();
+    refreshNotifications();
   });
+}
+
+// A tapped push notification opens the app at e.g. "/?tab=myswaps" — jump straight to that tab,
+// then tidy the address bar so a later reload doesn't keep forcing it.
+function tabFromUrl() {
+  var m = /[?&]tab=([a-z]+)/.exec(window.location.search || '');
+  if (!m) return null;
+  try { window.history.replaceState(null, '', window.location.pathname); } catch (e) { /* ignore */ }
+  return m[1];
 }
 
 /* ---------- push notifications (see lib/push.js + public/sw.js) ---------- */
@@ -91,11 +118,19 @@ function isStandaloneApp() { return window.navigator.standalone === true || (win
 // Reflects whatever the browser already knows (a previous subscribe that survived a reload)
 // into ui.pushSubscribed, so the topbar button shows the right state on load — does not
 // prompt for permission by itself.
+// If this browser already has a subscription, it's re-sent to the server on every load — that
+// (re)binds the device to whoever is logged in NOW, so a phone that changed hands (or a manager
+// testing with an employee login) gets that person's notifications, not the previous user's.
 function refreshPushState() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window) || !window.isSecureContext) { ui.pushSupported = false; render(); return; }
   ui.pushSupported = true;
+  ui.pushPermission = (window.Notification && Notification.permission) || null;
   navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); })
-    .then(function (sub) { ui.pushSubscribed = !!sub; render(); })
+    .then(function (sub) {
+      ui.pushSubscribed = !!sub;
+      if (sub && STATE && STATE.pushPublicKey) api('POST', '/api/push/subscribe', { subscription: sub.toJSON() });
+      render();
+    })
     .catch(function () {});
 }
 function subscribeToPush() {
@@ -108,6 +143,7 @@ function subscribeToPush() {
   navigator.serviceWorker.ready
     .then(function (reg) { return Notification.requestPermission().then(function (perm) { return { reg: reg, perm: perm }; }); })
     .then(function (r) {
+      ui.pushPermission = r.perm;
       if (r.perm !== 'granted') { throw new Error('permission_denied'); }
       return r.reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(STATE.pushPublicKey) });
     })
@@ -119,7 +155,7 @@ function subscribeToPush() {
     })
     .catch(function (e) {
       ui.pushBusy = false;
-      toast(e && e.message === 'permission_denied' ? 'לא ניתנה הרשאה להתראות' : 'שגיאה בהפעלת התראות', 'err');
+      toast(e && e.message === 'permission_denied' ? 'לא ניתנה הרשאה להתראות — אפשר לאשר אותן בהגדרות הדפדפן/הטלפון' : 'שגיאה בהפעלת התראות', 'err');
       render();
     });
 }
@@ -139,14 +175,31 @@ function login(mode, employeeId, pin) {
   ui.busy = true; render();
   api('POST', '/api/login', mode === 'manager' ? { mode: 'manager', pin: pin } : { mode: 'employee', employeeId: employeeId, pin: pin }).then(function (r) {
     ui.busy = false;
-    if (!r.ok) { ui.loginErr = 'קוד שגוי — נסה/י שוב'; render(); return; }
+    if (!r.ok) { ui.loginErr = r.status === 429 ? 'יותר מדי ניסיונות שגויים — נא לנסות שוב בעוד רבע שעה' : 'קוד שגוי — נסה/י שוב'; render(); return; }
     ui.loginErr = '';
     boot();
   });
 }
+// Logging out also detaches this phone from the person's notifications (the browser keeps its
+// subscription, and the next login re-binds it to whoever logs in — see refreshPushState).
+// Capped at 2.5s so a service worker that never became ready can't make the logout button hang.
+function unbindPushDevice() {
+  if (!ui.pushSupported || !navigator.serviceWorker) return Promise.resolve();
+  var work = navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); })
+    .then(function (sub) { if (sub) return api('POST', '/api/push/unsubscribe', { endpoint: sub.endpoint }); })
+    .catch(function () {});
+  return Promise.race([work, new Promise(function (r) { setTimeout(r, 2500); })]);
+}
+// Forget everything the previous user loaded (their availability, swaps, hours, and — after a
+// manager session — the employee list with PINs), so the next person on this device starts clean.
+function resetClientState() {
+  STATE = null; ui.tab = null; ui.modal = null;
+  CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
+  SEEN_NOTIF_IDS = null; _lastEnsuredTab = null; setAppBadge(0);
+}
 function logout() {
-  api('POST', '/api/logout').then(function () {
-    STATE = null; CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null }; ui.tab = null;
+  unbindPushDevice().then(function () { return api('POST', '/api/logout'); }).then(function () {
+    resetClientState();
     api('GET', '/api/public/employees').then(function (pr) { PUBLIC_EMPLOYEES = pr.ok ? pr.data.employees : []; render(); });
   });
 }
@@ -168,7 +221,73 @@ function loadSwaps(cb) {
   api('GET', '/api/swaps').then(function (r) { if (r.ok) CACHE.swaps = r.data.swaps; if (cb) cb(); render(); });
 }
 function loadNotifications(cb) {
-  api('GET', '/api/notifications').then(function (r) { if (r.ok) CACHE.notifications = r.data.notifications; if (cb) cb(); render(); });
+  api('GET', '/api/notifications').then(function (r) { if (r.ok) { CACHE.notifications = r.data.notifications; noteSeenNotifications(false); } if (cb) cb(); render(); });
+}
+
+/* ---------- notifications: badge + background refresh ---------- */
+function unreadCount() { return (CACHE.notifications || []).filter(function (n) { return !n.read; }).length; }
+function notifTabId() { return STATE && STATE.session.type === 'manager' ? 'requests' : 'mynotifs'; }
+// The installed app's icon badge (Android/desktop Chrome, iOS 16.4+ home-screen apps).
+function setAppBadge(n) {
+  try {
+    if (n > 0 && navigator.setAppBadge) navigator.setAppBadge(n).catch(function () {});
+    else if (navigator.clearAppBadge) navigator.clearAppBadge().catch(function () {});
+  } catch (e) { /* unsupported */ }
+}
+// Patches just the unread-count badges in place — no full re-render, so it can run while
+// someone is in the middle of filling in a form without wiping what they typed.
+function updateBadges() {
+  var n = unreadCount();
+  var els = document.querySelectorAll('[data-badge]');
+  for (var i = 0; i < els.length; i++) { els[i].textContent = n > 99 ? '99+' : String(n); els[i].hidden = !n; }
+  setAppBadge(n);
+}
+// Remembers which notifications this tab has already seen; with announce=true, any notification
+// that wasn't there before pops up as a toast (newest first, at most 2) so it isn't missed.
+function noteSeenNotifications(announce) {
+  var list = CACHE.notifications || [];
+  if (SEEN_NOTIF_IDS && announce) {
+    var fresh = list.filter(function (n) { return !n.read && !SEEN_NOTIF_IDS[n.id]; });
+    fresh.slice(0, 2).forEach(function (n) { toast('🔔 ' + n.text); });
+  }
+  SEEN_NOTIF_IDS = {};
+  list.forEach(function (n) { SEEN_NOTIF_IDS[n.id] = true; });
+}
+// Is the person typing/choosing something right now? Then a background refresh must not re-render.
+function isUserEditing() {
+  var a = document.activeElement;
+  return !!(a && a.closest && a.closest('#app') && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName));
+}
+function refreshNotifications() {
+  if (!STATE) return;
+  api('GET', '/api/notifications').then(function (r) {
+    if (!r.ok || !STATE) return;
+    var before = JSON.stringify((CACHE.notifications || []).map(function (n) { return n.id + (n.read ? 'r' : 'u'); }));
+    CACHE.notifications = r.data.notifications;
+    noteSeenNotifications(true);
+    var after = JSON.stringify(CACHE.notifications.map(function (n) { return n.id + (n.read ? 'r' : 'u'); }));
+    var showsList = ui.tab === 'mynotifs' || ui.tab === 'requests' || ui.tab === 'overview';
+    if (before !== after && showsList && !ui.modal && !isUserEditing()) render();
+    else updateBadges();
+    if (ui.tab === 'mynotifs') markAllReadSoon();
+  });
+}
+// An employee opening their התראות tab has seen them — clear the unread state shortly after
+// (the unread highlight stays visible for this view; the badge goes away).
+var _markReadTimer = null;
+function markAllReadSoon() {
+  if (!STATE || STATE.session.type !== 'employee' || !unreadCount() || _markReadTimer) return;
+  _markReadTimer = setTimeout(function () {
+    _markReadTimer = null;
+    if (ui.tab !== 'mynotifs') return;
+    var seen = CACHE.notifications || [];
+    var upTo = seen.reduce(function (m, n) { return Math.max(m, n.ts || 0); }, 0);
+    api('POST', '/api/notifications/read-all', { upTo: upTo }).then(function (r) {
+      if (!r.ok) return;
+      seen.forEach(function (n) { n.read = true; });
+      updateBadges();
+    });
+  }, 1500);
 }
 function loadHours(mk, cb) {
   api('GET', '/api/hours/' + mk).then(function (r) { if (r.ok) CACHE.hours[mk] = r.data.hours; if (cb) cb(); render(); });
@@ -224,6 +343,7 @@ function handleAction(action, el, ev) {
   if (action === 'logout') { logout(); return; }
   if (action === 'toggle-push-notif') { if (!ui.pushBusy) { if (ui.pushSubscribed) unsubscribeFromPush(); else subscribeToPush(); } return; }
   if (action === 'close-modal') { closeModal(); return; }
+  if (action === 'dismiss-push-banner') { lsSet('pushBannerDismissed', '1'); render(); return; }
 
   if (action === 'week-prev') { ui.currentWeek = addWeeks(ui.currentWeek, -1); render(); loadWeek(ui.currentWeek); return; }
   if (action === 'week-next') { ui.currentWeek = addWeeks(ui.currentWeek, 1); render(); loadWeek(ui.currentWeek); return; }
@@ -254,8 +374,15 @@ function handleAction(action, el, ev) {
     return;
   }
   if (action === 'remove-assignment') {
+    ui.modal = { type: 'confirm-remove', aid: el.getAttribute('data-aid') }; render(); return;
+  }
+  if (action === 'confirm-remove-go') {
     var aid = el.getAttribute('data-aid');
-    api('DELETE', '/api/assignment/' + aid).then(function (r) { if (r.ok) { toast('ההקצאה הוסרה'); loadWeek(ui.currentWeek); } });
+    closeModal();
+    api('DELETE', '/api/assignment/' + aid).then(function (r) {
+      if (r.ok) { toast(r.data.notified ? 'השיבוץ הוסר — נשלחה הודעה לעובד/ת' : 'השיבוץ הוסר', 'ok'); CACHE.swaps = null; loadWeek(ui.currentWeek); }
+      else toast('שגיאה בהסרה', 'err');
+    });
     return;
   }
   if (action === 'assign-slot') {
@@ -263,10 +390,10 @@ function handleAction(action, el, ev) {
     if (!empId) return;
     api('POST', '/api/schedule/' + ui.currentWeek + '/assign', { date: date, shiftTemplateId: tid, employeeId: empId }).then(function (r) {
       if (r.ok) {
-        if (r.data.constraintConflict) toast('שובץ/ה — אבל בניגוד לאילוץ שהעובד/ת הגיש/ה! נשלחה התראה', 'err');
-        else toast('שובץ', 'ok');
+        if (r.data.constraintConflict) toast('שובץ/ה — אבל בניגוד לזמינות שהעובד/ת הגיש/ה!', 'err');
+        else toast(r.data.notified ? 'שובץ — נשלחה הודעה לעובד/ת' : 'שובץ', 'ok');
         loadWeek(ui.currentWeek);
-      } else toast('שגיאה בשיבוץ', 'err');
+      } else { toast(r.status === 409 ? 'העובד/ת כבר משובץ/ת למשמרת הזו' : 'שגיאה בשיבוץ', 'err'); loadWeek(ui.currentWeek); }
     });
     return;
   }
@@ -306,8 +433,8 @@ function handleAction(action, el, ev) {
     var aid2 = el.getAttribute('data-aid');
     var kind = action === 'report-noshow' ? 'noshow' : 'swap';
     api('POST', '/api/assignment/' + aid2 + '/swap-request', { kind: kind }).then(function (r) {
-      if (r.ok) { toast('הבקשה נשלחה לעובדים המתאימים', 'ok'); loadWeek(weekKeyOf((CACHE.weeks[ui.currentWeek] && CACHE.weeks[ui.currentWeek].assignments.find(function(a){return a.id===aid2;}) || {}).date || ui.currentWeek)); CACHE.swaps = null; }
-      else toast('שגיאה בשליחת הבקשה', 'err');
+      if (r.ok) { toast('הבקשה נשלחה ל' + roleTeamPhrase(STATE.me.roleId), 'ok'); CACHE.swaps = null; loadSwaps(); loadWeek(ui.currentWeek); }
+      else toast(r.data && r.data.error === 'already_open' ? 'כבר קיימת בקשה פתוחה למשמרת הזו' : 'שגיאה בשליחת הבקשה', 'err');
     });
     return;
   }
@@ -315,7 +442,13 @@ function handleAction(action, el, ev) {
     var sid = el.getAttribute('data-id');
     api('POST', '/api/swaps/' + sid + '/claim').then(function (r) {
       if (r.ok) { toast('לקחת את המשמרת!', 'ok'); CACHE.swaps = null; CACHE.weeks = {}; loadSwaps(); }
-      else toast('לא ניתן היה לקחת את המשמרת', 'err');
+      else {
+        var err = r.data && r.data.error;
+        toast(err === 'overlap' ? 'אי אפשר — המשמרת חופפת למשמרת שכבר יש לך'
+          : err === 'not_open' ? 'המשמרת כבר נלקחה או שהבקשה בוטלה'
+          : 'לא ניתן היה לקחת את המשמרת', 'err');
+        CACHE.swaps = null; loadSwaps();
+      }
     });
     return;
   }
@@ -333,7 +466,8 @@ function handleAction(action, el, ev) {
     return;
   }
   if (action === 'mark-all-read') {
-    api('POST', '/api/notifications/read-all').then(function (r) { if (r.ok) loadNotifications(); });
+    var upToAll = (CACHE.notifications || []).reduce(function (m, n) { return Math.max(m, n.ts || 0); }, 0);
+    api('POST', '/api/notifications/read-all', { upTo: upToAll }).then(function (r) { if (r.ok) loadNotifications(); });
     return;
   }
   if (action === 'open-truth-picker') {
@@ -392,6 +526,7 @@ function handleSubmit(action, form) {
       shabbatEndDay: Number(f.get('shabbatEndDay')), shabbatEndTime: f.get('shabbatEndTime'),
       dailyOvertimeThreshold: Number(f.get('dailyOvertimeThreshold')), minRestHours: Number(f.get('minRestHours')),
       weeklyGenerationDow: Number(f.get('weeklyGenerationDow')),
+      autoGenerate: f.get('autoGenerate') === 'on',
     };
     api('PATCH', '/api/settings', payload3).then(function (r) {
       if (r.ok) { STATE.settings = r.data.settings; toast('ההגדרות נשמרו', 'ok'); render(); }
@@ -489,22 +624,34 @@ function ensureTabData() {
   if ((tab === 'hours' || tab === 'myhours') && !CACHE.hours[ui.currentMonth]) loadHours(ui.currentMonth);
   if ((tab === 'mynotifs' || tab === 'overview' || tab === 'requests') && !CACHE.notifications) loadNotifications();
   if (tab === 'myswaps' && !CACHE.swaps) loadSwaps();
+  if (tab === 'mynotifs') markAllReadSoon();
 }
 
 // Other people (an employee claiming a swap, requesting a swap, submitting availability)
 // change shared data server-side without this tab knowing — there's no push/websocket here,
 // so poll quietly in the background while a relevant tab is open. Full-list refreshes only
 // (never while a modal/form is open) so nothing interrupts something the user is mid-typing.
+// Notifications are refreshed on every tab (they drive the unread badge + the new-notification
+// toast), but in a way that never re-renders over a form someone is filling in.
 var LIVE_POLL_MS = 25000;
 setInterval(function () {
-  if (!STATE || !ui.tab || ui.modal) return;
+  if (!STATE || !ui.tab) return;
+  refreshNotifications();
+  if (ui.modal || isUserEditing()) return;
   var tab = ui.tab;
   if (tab === 'schedule' || tab === 'myschedule') loadWeek(ui.currentWeek);
-  if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); loadNotifications(); }
-  if (tab === 'requests') { loadSwaps(); loadAvailability(); loadNotifications(); }
+  if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); }
+  if (tab === 'requests') { loadSwaps(); loadAvailability(); }
   if (tab === 'myswaps') loadSwaps();
-  if (tab === 'mynotifs') loadNotifications();
 }, LIVE_POLL_MS);
+// Coming back to the app (unlocking the phone, switching back from another app) refreshes
+// right away instead of waiting for the next poll.
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState !== 'visible' || !STATE) return;
+  refreshNotifications();
+  if (!ui.modal && !isUserEditing() && (ui.tab === 'schedule' || ui.tab === 'myschedule')) loadWeek(ui.currentWeek);
+  if (!ui.modal && !isUserEditing() && (ui.tab === 'myswaps' || ui.tab === 'requests' || ui.tab === 'overview')) loadSwaps();
+});
 
 /* ============================================================ RENDER ============================================================ */
 function render() {
@@ -558,12 +705,36 @@ function shellHtml() {
       default: body = '';
     }
   }
+  var unread = unreadCount();
+  setAppBadge(unread);
   var pushBtn = ui.pushSupported === false ? '' : '<button class="iconbtn" data-action="toggle-push-notif" title="' + (ui.pushSubscribed ? 'התראות פעילות בטלפון — לחיצה לכיבוי' : 'הפעלת התראות בטלפון') + '"' + (ui.pushBusy ? ' disabled' : '') + '>' + (ui.pushSubscribed ? '🔔' : '🔕') + '</button>';
   return '<div class="topbar"><div class="brand">' + esc(STATE.settings.companyName || 'תמרה') + '<small>' + (isMgr ? 'ממשק ניהול' : esc(STATE.me ? STATE.me.name : '')) + '</small></div>'
     + '<div style="display:flex;gap:8px;">' + pushBtn + '<button class="btn secondary sm" data-action="logout">התנתקות</button></div></div>'
-    + '<div class="tabbar">' + tabs.map(function (t) { return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '"><span class="tab-ic">' + t[2] + '</span><span class="tab-lb">' + t[1] + '</span></button>'; }).join('') + '</div>'
-    + '<div class="wrap">' + body + '</div>'
+    + '<div class="tabbar">' + tabs.map(function (t) {
+        var badge = t[0] === notifTabId() ? '<span class="tab-badge" data-badge' + (unread ? '' : ' hidden') + '>' + (unread > 99 ? '99+' : unread) + '</span>' : '';
+        return '<button data-action="set-tab" data-tab="' + t[0] + '" class="' + (ui.tab === t[0] ? 'active' : '') + '"><span class="tab-ic">' + t[2] + badge + '</span><span class="tab-lb">' + t[1] + '</span></button>';
+      }).join('') + '</div>'
+    + '<div class="wrap">' + pushBannerHtml() + body + '</div>'
     + modalHtml();
+}
+
+// A clear invitation to turn on phone notifications — the small bell in the top bar alone is
+// easy to miss, and without it nobody gets swap requests / schedule changes on their phone.
+// iPhones only support notifications for the app added to the home screen, so there it explains
+// how to do that instead. Shown on the first tab only, until enabled or dismissed.
+function pushBannerHtml() {
+  var firstTab = STATE.session.type === 'manager' ? 'overview' : 'myschedule';
+  if (ui.tab !== firstTab || lsGet('pushBannerDismissed') === '1' || !STATE.pushPublicKey) return '';
+  var dismiss = '<button class="iconbtn" data-action="dismiss-push-banner" title="סגירה">✕</button>';
+  if (isIosDevice() && !isStandaloneApp()) {
+    return '<div class="banner push-banner"><div><b>רוצה לקבל התראות לטלפון?</b> באייפון צריך קודם להתקין את האתר כאפליקציה: לוחצים על כפתור השיתוף ⬆️ בתחתית המסך ← "הוספה למסך הבית", ואז פותחים את "משמרות" מהאייקון החדש ולוחצים שם על 🔕.</div>' + dismiss + '</div>';
+  }
+  if (!ui.pushSupported || ui.pushSubscribed) return '';
+  if (ui.pushPermission === 'denied') {
+    return '<div class="banner warn push-banner"><div><b>ההתראות חסומות בדפדפן.</b> כדי לקבל התראות על החלפות ושינויים בלוז, יש לאפשר התראות לאתר בהגדרות הדפדפן/הטלפון, ואז ללחוץ על 🔕 למעלה.</div>' + dismiss + '</div>';
+  }
+  return '<div class="banner push-banner"><div><b>הפעלת התראות לטלפון</b> — כדי לדעת מיד על בקשות החלפה, שינויים בלוז ופרסום לוז חדש.</div>'
+    + '<div style="display:flex;gap:6px;align-items:center;"><button class="btn sm" data-action="toggle-push-notif"' + (ui.pushBusy ? ' disabled' : '') + '>🔔 הפעלה</button>' + dismiss + '</div></div>';
 }
 
 var _lastEnsuredTab = null;
@@ -593,6 +764,9 @@ function overviewHtml() {
   var notifs = CACHE.notifications || [];
   var unread = notifs.filter(function (n) { return !n.read; }).length;
   var html = '';
+  if (String(STATE.settings.managerPin) === '1234') {
+    html += '<div class="banner err" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;"><div><b>קוד הכניסה של המנהל/ת הוא עדיין קוד ברירת המחדל (1234).</b> כל מי שמנחש אותו יכול להיכנס כמנהל/ת — מומלץ מאוד להחליף אותו.</div><button class="btn sm" data-action="set-tab" data-tab="settings">להחלפת הקוד</button></div>';
+  }
   if (!STATE.employees.length) {
     html += '<div class="card"><div class="card-head"><h2>ברוכים הבאים ללוח המשמרות</h2></div>'
       + '<div class="helpcard"><b>איך מתחילים:</b><ol>'
@@ -664,6 +838,9 @@ function notifIcon(n) {
   if (n.type === 'swap-claimed' || n.type === 'generated') return '✅';
   if (n.type === 'swap-open') return '🔁';
   if (n.type === 'understaffed') return '⚠️';
+  if (n.type === 'shift-added') return '➕';
+  if (n.type === 'shift-removed') return '➖';
+  if (n.type === 'schedule-published') return '📅';
   return 'ℹ️';
 }
 function notifDayLabel(ts) {
@@ -941,7 +1118,8 @@ function settingsHtml() {
     + '<h3>כללי שעות</h3><div class="field-row"><div class="field"><label>סף שעות נוספות ליום</label><input type="number" step="0.5" name="dailyOvertimeThreshold" value="' + esc(m.dailyOvertimeThreshold) + '"></div>'
     + '<div class="field"><label>מנוחה מינימלית (שעות)</label><input type="number" name="minRestHours" value="' + esc(m.minRestHours) + '"></div></div>'
     + '<h3>לוז שבועי אוטומטי</h3><div class="field"><label>יום הפקת הלוז</label><select name="weeklyGenerationDow">' + [0,1,2,3,4,5,6].map(function(d){return '<option value="'+d+'"'+(d===m.weeklyGenerationDow?' selected':'')+'>'+dowName(d)+'</option>';}).join('') + '</select></div>'
-    + '<div class="helpcard">כל יום חמישי בבוקר, השרת מפיק לבד את הלוז לשבוע הבא — לא צריך לבקש את זה. הגשת אילוצים לשבוע נעולה אוטומטית ביום רביעי בלילה שלפניו.</div>'
+    + '<div class="field"><label><input type="checkbox" name="autoGenerate" style="width:auto;display:inline-block;"' + (m.autoGenerate === false ? '' : ' checked') + '> הפקה אוטומטית של הלוז</label></div>'
+    + '<div class="helpcard">הגשת הזמינות לשבוע הבא ננעלת בלילה שלפני יום ההפקה (ברירת המחדל: רביעי ב-23:59). כשההפקה האוטומטית מסומנת, מיום ההפקה ואילך הלוז לשבוע הבא מופק לבד בכניסה הראשונה לאתר — אם עדיין לא הופק ידנית ולא התחלת לשבץ אותו ידנית. תמיד אפשר ללחוץ "הפק מחדש" אחר כך.</div>'
     + '<button class="btn" type="submit" style="margin-top:14px;">שמירה</button>'
     + '</form></div>'
     + templatesSettingsHtml();
@@ -1021,7 +1199,7 @@ function myScheduleHtml() {
     + '<button class="btn ' + (viewAll ? '' : 'secondary') + ' sm" data-action="toggle-my-schedule-view">' + (viewAll ? '👤 הלוז שלי' : '👥 לוז ' + roleTeamPhrase(STATE.me.roleId)) + '</button>'
     + '</div></div>';
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
-  if (!week.generatedAt) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
+  if (!week.generatedAt && !week.assignments.length) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
 
   if (viewAll) { html += teamScheduleHtml(wk, week) + '</div>'; return html; }
 
@@ -1164,6 +1342,15 @@ function modalHtml() {
         }).join('') + '</div></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
+  } else if (m.type === 'confirm-remove') {
+    var weekObjR = CACHE.weeks[ui.currentWeek];
+    var aObjR = weekObjR && weekObjR.assignments.find(function (x) { return x.id === m.aid; });
+    var tR = aObjR ? STATE.shiftTemplates.find(function (tt) { return tt.id === aObjR.shiftTemplateId; }) : null;
+    var eR = aObjR ? STATE.employees.find(function (e) { return e.id === aObjR.employeeId; }) : null;
+    var future = aObjR && aObjR.date >= todayStr();
+    inner = '<h3>הסרת שיבוץ</h3><p>להסיר את <b>' + esc(eR ? eR.name : '?') + '</b> מהמשמרת' + (tR ? (' <b>' + esc(tR.label) + '</b>, ' + dayDateHtml(aObjR.date)) : '') + '?'
+      + (future ? '<br><span style="color:var(--text-dim);font-size:13px;">העובד/ת יקבל/תקבל על כך הודעה.</span>' : '') + '</p>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn secondary" data-action="close-modal">ביטול</button><button class="btn danger" data-action="confirm-remove-go" data-aid="' + esc(m.aid) + '">הסרה</button></div>';
   } else if (m.type === 'confirm-swap') {
     var aidC = m.aid;
     var weekObjC = CACHE.weeks[ui.currentWeek];
