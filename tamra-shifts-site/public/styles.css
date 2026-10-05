@@ -231,3 +231,23 @@ table.xltable tr.subrow .subrow-label { font-weight: 700; color: var(--text); }
 .push-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #fdf0e3; color: var(--accent-ink); border: 1px solid #f3d2b3; margin-top: 12px; }
 .push-banner .iconbtn { flex-shrink: 0; }
 @media (max-width: 640px) { .push-banner { flex-direction: column; align-items: stretch; } }
+
+/* employees table: inline "shifts per week" / "night only" controls */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.inline-select { min-height: 32px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); font: inherit; font-size: 13px; }
+.inline-check { width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer; }
+
+/* schedule tab: shifts this week per employee vs. the number set for them */
+.quota-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0; font-size: 13px; }
+.quota-title { color: var(--text-dim); font-weight: 600; }
+.quota-chip { background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; white-space: nowrap; }
+.quota-chip.ok { background: #e3f1e8; border-color: #b9dcc6; color: var(--ok); }
+.quota-chip.short { background: #fbdcd6; border-color: #f0b8ad; color: #7a2214; }
+.quota-chip.over { background: #fdeccb; border-color: #f2d59a; color: #7a4a0c; }
+
+/* "assign anyway?" dialog */
+.warn-list { margin: 0 0 14px; padding-inline-start: 4px; list-style: none; font-size: 14px; color: #7a2214; }
+.warn-list li { margin: 4px 0; }
+
+/* toasts never block a tap on what's underneath them (e.g. a dialog's buttons) */
+.toastzone { pointer-events: none; }

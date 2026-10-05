@@ -32,6 +32,19 @@ function roleLabelPlural(id){ return id==='fuel'?'מתדלקים':(id==='store'?
 // Grammatically-correct "כל ה..." phrasing per role (roleLabelPlural alone doesn't take a
 // uniform "ה" prefix: "כל המתדלקים" vs "כל עובדי החנות").
 function roleTeamPhrase(id){ return id==='fuel'?'כל המתדלקים':(id==='store'?'כל עובדי החנות':'כל הצוות'); }
+// The manager's per-employee rules (see lib/schedule.js): a set number of shifts per week
+// (maxShiftsPerWeek, 1-7, null = flexible) and "night only".
+function shiftTargetOf(e){ var n = Number(e && e.maxShiftsPerWeek); return n >= 1 && n <= 7 ? n : null; }
+function shiftTargetSelectHtml(e, attrs){
+  var cur = shiftTargetOf(e);
+  return '<select ' + attrs + '><option value=""' + (cur ? '' : ' selected') + '>גמיש</option>'
+    + [1,2,3,4,5,6,7].map(function (n) { return '<option value="' + n + '"' + (cur === n ? ' selected' : '') + '>' + n + '</option>'; }).join('') + '</select>';
+}
+var RULE_WARNING_TEXT = {
+  night_only: 'העובד/ת מסומן/ת "לילה בלבד" וזו לא משמרת לילה',
+  after_night: 'זה מתנגש עם משמרת לילה — אין משמרת יום ביום שאחרי לילה',
+  quota_full: 'העובד/ת כבר קיבל/ה את מספר המשמרות שהוגדר לו/ה לשבוע',
+};
 function genderLabel(g){ return g==='male'?'זכר':(g==='female'?'נקבה':'לא צוין'); }
 function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-female':'gender-unset'); }
 
@@ -388,13 +401,13 @@ function handleAction(action, el, ev) {
   if (action === 'assign-slot') {
     var date = el.getAttribute('data-date'), tid = el.getAttribute('data-tid'), empId = el.value;
     if (!empId) return;
-    api('POST', '/api/schedule/' + ui.currentWeek + '/assign', { date: date, shiftTemplateId: tid, employeeId: empId }).then(function (r) {
-      if (r.ok) {
-        if (r.data.constraintConflict) toast('שובץ/ה — אבל בניגוד לזמינות שהעובד/ת הגיש/ה!', 'err');
-        else toast(r.data.notified ? 'שובץ — נשלחה הודעה לעובד/ת' : 'שובץ', 'ok');
-        loadWeek(ui.currentWeek);
-      } else { toast(r.status === 409 ? 'העובד/ת כבר משובץ/ת למשמרת הזו' : 'שגיאה בשיבוץ', 'err'); loadWeek(ui.currentWeek); }
-    });
+    doAssign(date, tid, empId, false);
+    return;
+  }
+  if (action === 'confirm-assign-go') {
+    var ca = ui.modal;
+    closeModal();
+    if (ca && ca.type === 'confirm-assign') doAssign(ca.date, ca.tid, ca.empId, true);
     return;
   }
 
@@ -445,6 +458,8 @@ function handleAction(action, el, ev) {
       else {
         var err = r.data && r.data.error;
         toast(err === 'overlap' ? 'אי אפשר — המשמרת חופפת למשמרת שכבר יש לך'
+          : err === 'night_only' ? 'אי אפשר — את/ה מסומן/ת למשמרות לילה בלבד (אפשר לפנות למנהל/ת)'
+          : err === 'after_night' ? 'אי אפשר — המשמרת צמודה למשמרת לילה שלך (אפשר לפנות למנהל/ת)'
           : err === 'not_open' ? 'המשמרת כבר נלקחה או שהבקשה בוטלה'
           : 'לא ניתן היה לקחת את המשמרת', 'err');
         CACHE.swaps = null; loadSwaps();
@@ -478,6 +493,36 @@ function handleAction(action, el, ev) {
   if (action === 'clear-truth-hours') { CACHE.truthHours = null; ui.truthError = ''; render(); return; }
 }
 
+// Manual assignment. If it breaks one of the manager's own rules (night only / day after a
+// night / set number of shifts), the server refuses until the manager confirms in a dialog.
+function doAssign(date, tid, empId, override) {
+  api('POST', '/api/schedule/' + ui.currentWeek + '/assign', { date: date, shiftTemplateId: tid, employeeId: empId, override: !!override }).then(function (r) {
+    if (r.ok) {
+      if (r.data.constraintConflict) toast('שובץ/ה — אבל בניגוד לזמינות שהעובד/ת הגיש/ה!', 'err');
+      else toast(r.data.notified ? 'שובץ — נשלחה הודעה לעובד/ת ולצוות' : 'שובץ', 'ok');
+      loadWeek(ui.currentWeek);
+      return;
+    }
+    if (r.status === 409 && r.data && r.data.error === 'needs_confirmation') {
+      ui.modal = { type: 'confirm-assign', date: date, tid: tid, empId: empId, warnings: r.data.warnings || [] };
+      render();
+      return;
+    }
+    toast(r.status === 409 ? 'העובד/ת כבר משובץ/ת למשמרת הזו' : 'שגיאה בשיבוץ', 'err');
+    loadWeek(ui.currentWeek);
+  });
+}
+// Inline edits in the employees table (shifts per week / night only) — saved right away.
+function patchEmployeeInline(id, patch) {
+  api('PATCH', '/api/employees/' + id, patch).then(function (r) {
+    if (!r.ok) { toast('שגיאה בשמירה', 'err'); loadEmployeesFull(); return; }
+    var list = CACHE.employeesFull || [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) list[i] = r.data.employee;
+    toast('נשמר', 'ok');
+    refreshBootstrapEmployees();
+  });
+}
+
 /* ---------- forms ---------- */
 function handleSubmit(action, form) {
   var f = new FormData(form);
@@ -487,7 +532,8 @@ function handleSubmit(action, form) {
     return;
   }
   if (action === 'submit-employee') {
-    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin'), gender: f.get('gender') || null, isSenior: f.get('isSenior') === 'on' };
+    var payload = { name: f.get('name'), roleId: f.get('roleId'), pin: f.get('pin'), gender: f.get('gender') || null, isSenior: f.get('isSenior') === 'on',
+      maxShiftsPerWeek: f.get('maxShiftsPerWeek') ? Number(f.get('maxShiftsPerWeek')) : null, nightOnly: f.get('nightOnly') === 'on' };
     var editing = ui.modal && ui.modal.employee;
     var call = editing ? api('PATCH', '/api/employees/' + ui.modal.employee.id, payload) : api('POST', '/api/employees', payload);
     call.then(function (r) {
@@ -554,6 +600,8 @@ document.addEventListener('change', function (e) {
   var el = e.target.closest('[data-action]');
   if (!el) return;
   if (el.getAttribute('data-action') === 'assign-slot') handleAction('assign-slot', el, e);
+  if (el.getAttribute('data-action') === 'set-emp-target') patchEmployeeInline(el.getAttribute('data-id'), { maxShiftsPerWeek: el.value ? Number(el.value) : null });
+  if (el.getAttribute('data-action') === 'set-emp-night') patchEmployeeInline(el.getAttribute('data-id'), { nightOnly: el.checked });
   if (el.getAttribute('data-action') === 'truth-file-picked') {
     var f = el.files && el.files[0];
     el.value = ''; // allow re-selecting the same file again later
@@ -841,6 +889,7 @@ function notifIcon(n) {
   if (n.type === 'shift-added') return '➕';
   if (n.type === 'shift-removed') return '➖';
   if (n.type === 'schedule-published') return '📅';
+  if (n.type === 'schedule-changed') return '🔄';
   return 'ℹ️';
 }
 function notifDayLabel(ts) {
@@ -910,6 +959,17 @@ function scheduleHtml() {
   if (roleUnderstaffed.length) {
     html += '<div class="banner err">⚠️ יש ' + roleUnderstaffed.length + ' משמרות ' + esc(roleLabelPlural(roleFilter)) + ' ללא איוש מלא השבוע — ראה/י פירוט בכרטיסי הימים למטה וניתן לשבץ ידנית.</div>';
   }
+  // How many shifts each employee of this team has this week, against the number set for them.
+  var weekCount = {};
+  week.assignments.forEach(function (a) { weekCount[a.employeeId] = (weekCount[a.employeeId] || 0) + 1; });
+  var teamEmps = STATE.employees.filter(function (e) { return e.active && e.roleId === roleFilter; });
+  if (teamEmps.length && week.assignments.length) {
+    html += '<div class="quota-row"><span class="quota-title">משמרות השבוע:</span>' + teamEmps.map(function (e) {
+      var n = weekCount[e.id] || 0, target = shiftTargetOf(e);
+      var cls = target == null ? '' : (n === target ? ' ok' : (n < target ? ' short' : ' over'));
+      return '<span class="quota-chip' + cls + '" title="' + (target == null ? 'גמיש' : ('הוגדרו ' + target + ' משמרות')) + '">' + esc(e.name) + (e.nightOnly ? ' 🌙' : '') + ' <b class="mono">' + n + (target != null ? '/' + target : '') + '</b></span>';
+    }).join('') + '</div>';
+  }
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
     + (week.generatedAt ? ('<a class="btn secondary sm" href="/api/schedule/' + wk + '/export.xlsx" download>⬇️ ייצוא לאקסל</a>') : '')
@@ -940,7 +1000,7 @@ function scheduleHtml() {
           + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
           + (seniorIssue ? '<span class="cal-chip understaffed">אין ותיק/ה</span>' : '')
           + '</div>'
-          + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'</option>';}).join('') + '</select>') : '')
+          + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){var tg=shiftTargetOf(e);return '<option value="'+e.id+'">'+esc(e.name)+(e.nightOnly?' 🌙':'')+' ('+(weekCount[e.id]||0)+(tg!=null?'/'+tg:'')+')</option>';}).join('') + '</select>') : '')
           + '</div>';
       }).join('');
     }
@@ -960,13 +1020,16 @@ function employeesHtml() {
       + '<button type="button" data-action="set-employees-gender" data-gender="male" class="' + (genderFilter==='male'?'active':'') + '">זכר (' + all.filter(function(e){return e.gender==='male';}).length + ')</button>'
       + '<button type="button" data-action="set-employees-gender" data-gender="female" class="' + (genderFilter==='female'?'active':'') + '">נקבה (' + all.filter(function(e){return e.gender==='female';}).length + ')</button>'
     + '</div>'
-    + '<table><thead><tr><th>שם</th><th>תפקיד</th><th>מגדר</th><th>PIN</th><th>סטטוס</th><th></th></tr></thead><tbody>'
+    + '<div class="helpcard" style="margin-bottom:10px;"><b>משמרות בשבוע</b> — כמה משמרות העובד/ת יקבל/תקבל בהפקה האוטומטית (בדיוק המספר הזה, אם הזמינות וכללי המנוחה מאפשרים; "גמיש" = חלוקה הוגנת לפי שעות). <b>🌙 לילה בלבד</b> — ישובץ/תשובץ אוטומטית רק למשמרות לילה. בשיבוץ ידני אפשר לחרוג מהכללים האלה אחרי אישור.</div>'
+    + '<div class="table-scroll"><table><thead><tr><th>שם</th><th>תפקיד</th><th>משמרות בשבוע</th><th>לילה בלבד</th><th>מגדר</th><th>PIN</th><th>סטטוס</th><th></th></tr></thead><tbody>'
     + list.map(function (e) {
-      return '<tr><td>' + esc(e.name) + (e.isSenior ? ' <span class="pill avail-all" title="מתדלק/ת ותיק/ה">ותיק/ה</span>' : '') + '</td><td><span class="pill ' + roleClass(e.roleId) + '">' + esc(roleLabel(e.roleId)) + '</span></td>'
+      return '<tr><td>' + esc(e.name) + (e.nightOnly ? ' 🌙' : '') + (e.isSenior ? ' <span class="pill avail-all" title="מתדלק/ת ותיק/ה">ותיק/ה</span>' : '') + '</td><td><span class="pill ' + roleClass(e.roleId) + '">' + esc(roleLabel(e.roleId)) + '</span></td>'
+        + '<td>' + shiftTargetSelectHtml(e, 'class="inline-select" data-action="set-emp-target" data-id="' + e.id + '" aria-label="משמרות בשבוע"') + '</td>'
+        + '<td style="text-align:center;"><input type="checkbox" class="inline-check" data-action="set-emp-night" data-id="' + e.id + '"' + (e.nightOnly ? ' checked' : '') + ' aria-label="לילה בלבד"></td>'
         + '<td><span class="pill ' + genderClass(e.gender) + '">' + esc(genderLabel(e.gender)) + '</span></td>'
         + '<td class="mono">' + esc(e.pin || '••••') + '</td><td>' + (e.active ? 'פעיל/ה' : 'לא פעיל/ה') + '</td>'
         + '<td><button class="iconbtn" data-action="edit-employee" data-id="' + e.id + '">עריכה</button> <button class="iconbtn" data-action="deactivate-employee" data-id="' + e.id + '">' + (e.active ? 'השבתה' : 'הפעלה') + '</button></td></tr>';
-    }).join('') + '</tbody></table>'
+    }).join('') + '</tbody></table></div>'
     + (list.length ? '' : '<div class="empty">' + (all.length ? 'אין עובדים בסינון הזה' : 'אין עדיין עובדים — הוסיפו את הראשון/ה') + '</div>')
     + '</div>';
 }
@@ -1325,6 +1388,8 @@ function modalHtml() {
         + (e && e.roleId === 'office' ? '<option value="office" selected>פקיד/ה (תפקיד שהוסר — אפשר לבחור תפקיד אחר)</option>' : '') + '</select></div>'
       + '<div class="field"><label>קוד PIN אישי</label><input name="pin" pattern="[0-9]{4,6}" required value="' + (e ? esc(e.pin||'') : '') + '"></div>'
       + '<div class="field"><label>מגדר</label><select name="gender" required><option value="">בחר/י</option><option value="male"' + (e && e.gender==='male'?' selected':'') + '>זכר</option><option value="female"' + (e && e.gender==='female'?' selected':'') + '>נקבה</option></select></div>'
+      + '<div class="field"><label>משמרות בשבוע</label>' + shiftTargetSelectHtml(e, 'name="maxShiftsPerWeek"') + '</div>'
+      + '<div class="field"><label><input type="checkbox" name="nightOnly" style="width:auto;display:inline-block;"' + (e && e.nightOnly ? ' checked' : '') + '> 🌙 לילה בלבד <span style="font-weight:400;color:var(--text-dim);">(בהפקה האוטומטית ישובץ/תשובץ רק למשמרות לילה)</span></label></div>'
       + '<div class="field"><label><input type="checkbox" name="isSenior" style="width:auto;display:inline-block;"' + (e && e.isSeniorManual ? ' checked' : '') + '> מתדלק/ת ותיק/ה <span style="font-weight:400;color:var(--text-dim);">(רלוונטי למתדלקים בלבד — בכל משמרת מתדלקים חייב להיות משובץ לפחות מתדלק/ת ותיק/ה אחד/ת. כל מתדלק/ת מקבל/ת ותק אוטומטית אחרי חודשיים במערכת — אפשר גם לסמן ידנית מוקדם יותר)</span></label></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
@@ -1342,6 +1407,12 @@ function modalHtml() {
         }).join('') + '</div></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
+  } else if (m.type === 'confirm-assign') {
+    var tA = STATE.shiftTemplates.find(function (tt) { return tt.id === m.tid; });
+    var eA = STATE.employees.find(function (x) { return x.id === m.empId; });
+    inner = '<h3>שיבוץ חריג</h3><p>לשבץ את <b>' + esc(eA ? eA.name : '?') + '</b> למשמרת' + (tA ? (' <b>' + esc(tA.label) + '</b>, ' + dayDateHtml(m.date)) : '') + '?</p>'
+      + '<ul class="warn-list">' + (m.warnings || []).map(function (w) { return '<li>⚠️ ' + esc(RULE_WARNING_TEXT[w] || w) + '</li>'; }).join('') + '</ul>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" data-action="confirm-assign-go">לשבץ בכל זאת</button></div>';
   } else if (m.type === 'confirm-remove') {
     var weekObjR = CACHE.weeks[ui.currentWeek];
     var aObjR = weekObjR && weekObjR.assignments.find(function (x) { return x.id === m.aid; });
