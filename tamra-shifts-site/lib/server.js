@@ -16,6 +16,9 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=u
 const VALID_ROLES = ['fuel', 'store']; // office removed — no shifts are scheduled for it anymore
 const VALID_GENDERS = ['male', 'female'];
 function isValidTimeStr(s) { return typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s); }
+// Shifts per week the manager sets for an employee: null/'' = flexible, otherwise a whole number 1-7.
+function isValidShiftTarget(v) { return v == null || v === '' || (Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 7); }
+function normShiftTarget(v) { return v == null || v === '' ? null : Number(v); }
 function isValidDaysArray(d) { return Array.isArray(d) && d.length > 0 && d.every(x => Number.isInteger(x) && x >= 0 && x <= 6); }
 
 function sendJson(res, status, obj) {
@@ -261,7 +264,8 @@ function makeApp(store, opts) {
     if (!body.name || !body.roleId || !body.pin) return sendJson(res, 400, { error: 'missing_fields' });
     if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
-    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: body.maxShiftsPerWeek || null, gender: body.gender || null, isSenior: !!body.isSenior });
+    if (!isValidShiftTarget(body.maxShiftsPerWeek)) return sendJson(res, 400, { error: 'invalid_shifts_per_week' });
+    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: normShiftTarget(body.maxShiftsPerWeek), gender: body.gender || null, isSenior: !!body.isSenior, nightOnly: !!body.nightOnly });
     return sendJson(res, 200, { employee: emp });
   });
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
@@ -271,7 +275,11 @@ function makeApp(store, opts) {
     // (e.g. pre-existing office) employee should not be blocked by this.
     if (body.roleId && body.roleId !== 'office' && !VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
-    const emp = await store.updateEmployee(params.id, body);
+    if (body.maxShiftsPerWeek !== undefined && !isValidShiftTarget(body.maxShiftsPerWeek)) return sendJson(res, 400, { error: 'invalid_shifts_per_week' });
+    const patch = Object.assign({}, body);
+    if (patch.maxShiftsPerWeek !== undefined) patch.maxShiftsPerWeek = normShiftTarget(patch.maxShiftsPerWeek);
+    if (patch.nightOnly !== undefined) patch.nightOnly = !!patch.nightOnly;
+    const emp = await store.updateEmployee(params.id, patch);
     if (!emp) return sendJson(res, 404, { error: 'not_found' });
     // A deactivated employee's phones stop getting this company's notifications.
     if (body.active === false) await store.deletePushSubscriptionsForEmployee(emp.id);
@@ -364,9 +372,10 @@ function makeApp(store, opts) {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
     try {
-      const result = await actions.manualAssign(store, { weekStart: params.weekStart, date: body.date, shiftTemplateId: body.shiftTemplateId, employeeId: body.employeeId });
+      const result = await actions.manualAssign(store, { weekStart: params.weekStart, date: body.date, shiftTemplateId: body.shiftTemplateId, employeeId: body.employeeId, override: !!body.override });
       return sendJson(res, 200, result);
     } catch (e) {
+      if (e.message === 'needs_confirmation') return sendJson(res, 409, { error: e.message, warnings: e.warnings });
       if (e.message === 'already_assigned') return sendJson(res, 409, { error: e.message });
       if (['invalid_date', 'invalid_template', 'invalid_employee'].includes(e.message)) return sendJson(res, 400, { error: e.message });
       throw e;
@@ -417,7 +426,7 @@ function makeApp(store, opts) {
         const avail = await store.listAvailability({ fromDate: s.date, toDate: s.date });
         const choiceByEmp = {}; avail.forEach(a => { choiceByEmp[a.employeeId] = a.choice; });
         s.candidates = employees
-          .filter(e => e.active && e.roleId === s.roleId && e.id !== s.requesterId)
+          .filter(e => e.active && e.roleId === s.roleId && e.id !== s.requesterId && !(e.nightOnly && !S.isNightTemplate(template)))
           .filter(e => S.isAvailableForShift(choiceByEmp[e.id] === undefined ? 'all' : choiceByEmp[e.id], bucket))
           .map(e => ({ id: e.id, name: e.name }));
       }

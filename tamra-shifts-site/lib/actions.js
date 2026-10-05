@@ -48,6 +48,99 @@ async function retractSwapOffers(store, swapIds) {
   }
 }
 
+// The manager's per-employee rules (see lib/schedule.js generateSchedule) as they apply to one
+// more shift for `employee`: returns the list of rules it would break —
+//   'night_only'  — the employee is marked "night only" and this isn't a night shift;
+//   'after_night' — a day shift the day after one of their night shifts, or a night shift the
+//                   evening before one of their day shifts;
+//   'quota_full'  — they already have the number of shifts per week set for them (checkQuota).
+// Auto-generation never breaks these; a manual assignment can, after the manager confirms.
+async function ruleWarnings(store, employee, template, date, { checkQuota, ignoreAssignmentId } = {}) {
+  const warnings = [];
+  const night = S.isNightTemplate(template);
+  if (employee.nightOnly && !night) warnings.push('night_only');
+  const templatesById = {};
+  (await store.listShiftTemplates()).forEach(t => { templatesById[t.id] = t; });
+  const nearby = (await store.listAssignmentsInRange(S.addDays(date, -1), S.addDays(date, 1)))
+    .filter(a => a.employeeId === employee.id && a.id !== ignoreAssignmentId);
+  const prevDay = S.addDays(date, -1), nextDay = S.addDays(date, 1);
+  const breaksNightRule = nearby.some(a => {
+    const t = templatesById[a.shiftTemplateId];
+    if (!t) return false;
+    if (!night && a.date === prevDay && S.isNightTemplate(t)) return true;
+    if (night && a.date === nextDay && !S.isNightTemplate(t)) return true;
+    return false;
+  });
+  if (breaksNightRule) warnings.push('after_night');
+  const target = S.shiftTarget(employee);
+  if (checkQuota && target != null) {
+    const weekStart = S.weekKeyOf(date);
+    const inWeek = (await store.listAssignmentsInRange(weekStart, S.addDays(weekStart, 6))).filter(a => a.employeeId === employee.id && a.id !== ignoreAssignmentId);
+    if (inWeek.length >= target) warnings.push('quota_full');
+  }
+  return warnings;
+}
+
+// ---------- "the schedule changed" notes to the whole team ----------
+// When the manager edits a week by hand, everyone in the affected team — fuel attendants for a
+// fuel shift, store employees for a store shift, never the other team — is told. Edits usually
+// come in bursts (add, remove, add...), so they're collected per week+team and sent as ONE note
+// once the manager has stopped editing for a minute, instead of a separate ping for every click.
+// (The employee who was added/removed also gets their own personal note right away.)
+let teamChangeDelayMs = Number(process.env.SCHEDULE_CHANGE_NOTIFY_DELAY_MS || 60000);
+const pendingTeamChanges = new Map();
+function setTeamChangeDelay(ms) { teamChangeDelayMs = ms; }
+const ROLE_TEAM = { fuel: 'המתדלקים', store: 'עובדי החנות' };
+const storeIds = new WeakMap(); // one queue per store (company), keyed by the store object itself
+let nextStoreId = 1;
+function queueTeamChange(store, weekStart, roleId, line) {
+  if (!storeIds.has(store)) storeIds.set(store, nextStoreId++);
+  const key = storeIds.get(store) + '|' + weekStart + '|' + roleId;
+  let p = pendingTeamChanges.get(key);
+  if (!p) { p = { store, weekStart, roleId, lines: [] }; pendingTeamChanges.set(key, p); }
+  p.lines.push(line);
+  clearTimeout(p.timer);
+  p.timer = setTimeout(() => { sendTeamChange(key).catch(err => console.error('[team-change] failed:', err && err.message)); }, teamChangeDelayMs);
+  if (p.timer.unref) p.timer.unref();
+}
+async function sendTeamChange(key) {
+  const p = pendingTeamChanges.get(key);
+  if (!p) return;
+  pendingTeamChanges.delete(key);
+  clearTimeout(p.timer);
+  const { store, weekStart, roleId, lines } = p;
+  const [employees, settings] = await Promise.all([store.listEmployees(), store.getSettings()]);
+  const team = employees.filter(e => e.active && e.roleId === roleId).map(e => e.id);
+  if (!team.length) return;
+  const teamName = ROLE_TEAM[roleId] || 'הצוות';
+  const shown = lines.slice(0, 8).map(l => '• ' + l);
+  if (lines.length > shown.length) shown.push('• ועוד ' + (lines.length - shown.length) + ' שינויים');
+  for (const employeeId of team) {
+    await store.addNotification({
+      audience: 'employee', employeeId, type: 'schedule-changed', relatedId: weekStart,
+      text: 'עדכון בסידור ' + teamName + ' לשבוע ' + weekRangeLabel(weekStart) + ':\n' + shown.join('\n'),
+      severity: 'info', channels: ['inapp', 'push'],
+    });
+  }
+  await safePush(push.broadcastTo(store, {
+    title: pushTitle(settings),
+    body: 'עודכן סידור ' + teamName + ' לשבוע ' + weekRangeLabel(weekStart) + (lines.length > 1 ? (' (' + lines.length + ' שינויים)') : (': ' + lines[0])),
+    tag: 'schedule-change-' + roleId + '-' + weekStart,
+    url: '/?tab=myschedule',
+  }, push.toEmployees(team)), 'schedule-changed');
+}
+function dropTeamChanges(store, weekStart) {
+  const id = storeIds.get(store);
+  if (!id) return;
+  for (const [key, p] of Array.from(pendingTeamChanges.entries())) {
+    if (key.indexOf(id + '|' + weekStart + '|') === 0) { clearTimeout(p.timer); pendingTeamChanges.delete(key); }
+  }
+}
+// Sends every queued team note now (tests, and a clean way to not wait for the timer).
+async function flushTeamChanges() {
+  for (const key of Array.from(pendingTeamChanges.keys())) await sendTeamChange(key);
+}
+
 async function generateWeek(store, weekStart, { force } = {}) {
   const existing = await store.getScheduleWeek(weekStart);
   if (existing && !force) {
@@ -58,15 +151,17 @@ async function generateWeek(store, weekStart, { force } = {}) {
     store.listAvailability({ fromDate: weekStart, toDate: S.addDays(weekStart, 6) }),
     store.getSettings(),
   ]);
-  const priorWeekStart = S.addWeeks(weekStart, -1);
-  const priorWeek = await store.getScheduleWeek(priorWeekStart);
+  // The weeks on either side, so rest and night rules hold across the week boundary too (the
+  // week after matters when an already-built week is regenerated).
+  const [priorWeek, nextWeek] = await Promise.all([store.getScheduleWeek(S.addWeeks(weekStart, -1)), store.getScheduleWeek(S.addWeeks(weekStart, 1))]);
   const templatesById = {};
   shiftTemplates.forEach(t => { templatesById[t.id] = t; });
-  const priorAssignments = (priorWeek ? priorWeek.assignments : [])
+  const withStart = (week) => (week ? week.assignments : [])
     .filter(a => templatesById[a.shiftTemplateId])
     .map(a => Object.assign({}, a, { _startTs: S.shiftStartTs(a, templatesById) }));
 
-  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, availability, meta, priorAssignments });
+  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, availability, meta, priorAssignments: withStart(priorWeek), followingAssignments: withStart(nextWeek) });
+  dropTeamChanges(store, weekStart); // the whole week is being redone — its pending edit notes are moot
   await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt);
 
   // Regenerating replaces every assignment row of the week, so any swap request still open for
@@ -115,6 +210,19 @@ async function generateWeek(store, weekStart, { force } = {}) {
     });
   }
 
+  // Who couldn't be given the number of shifts the manager set for them (their availability, rest
+  // rules or "night only" didn't leave enough room) — so the manager can see it and decide.
+  await store.deleteNotifications({ audience: 'manager', type: 'quota-shortfall', relatedId: weekStart });
+  if (result.quotaIssues && result.quotaIssues.length) {
+    const nameOf = {}; employees.forEach(e => { nameOf[e.id] = e.name; });
+    await store.addNotification({
+      audience: 'manager', type: 'quota-shortfall', relatedId: weekStart,
+      text: 'הלוז לשבוע ' + weekStart + ' — לא כל העובדים קיבלו את מספר המשמרות שהוגדר להם (בגלל הזמינות שהגישו, כללי המנוחה או "לילה בלבד"): '
+        + result.quotaIssues.map(q => (nameOf[q.employeeId] || '?') + ' ' + q.assigned + '/' + q.target).join(', ') + '. אפשר להשלים בשיבוץ ידני.',
+      severity: 'warning', channels: ['inapp'],
+    });
+  }
+
   // Every active employee gets a personal "the schedule is out" note in their own התראות tab,
   // with how many shifts they got — replacing the previous one if this week is regenerated.
   await store.deleteNotifications({ audience: 'employee', type: 'schedule-published', relatedId: weekStart });
@@ -124,7 +232,7 @@ async function generateWeek(store, weekStart, { force } = {}) {
     const n = countByEmp[e.id] || 0;
     await store.addNotification({
       audience: 'employee', employeeId: e.id, type: 'schedule-published', relatedId: weekStart,
-      text: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + ' פורסם — ' + (n ? ('שובצת ל-' + n + ' משמרות. לפרטים: לשונית "הלוז שלי".') : 'לא שובצת למשמרות בשבוע הזה.'),
+      text: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + (existing ? ' עודכן' : ' פורסם') + ' — ' + (n ? ('שובצת ל-' + n + ' משמרות. לפרטים: לשונית "הלוז שלי".') : 'לא שובצת למשמרות בשבוע הזה.'),
       severity: 'info', channels: ['inapp'],
     });
   }
@@ -153,7 +261,7 @@ async function generateWeek(store, weekStart, { force } = {}) {
   }, push.toManagers()), 'schedule-generated (manager)');
   await safePush(push.broadcastTo(store, {
     title: pushTitle(settings),
-    body: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + ' פורסם — אפשר לראות את המשמרות שלך',
+    body: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + (existing ? ' עודכן' : ' פורסם') + ' — אפשר לראות את המשמרות שלך',
     tag: 'schedule-' + weekStart,
     url: '/?tab=myschedule',
   }, push.toEmployees(employees.filter(e => e.active).map(e => e.id))), 'schedule-generated (employees)');
@@ -172,7 +280,9 @@ async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
   // Only colleagues in the SAME role as the requester — a fuel shift can only be taken by
   // another מתדלק/ת, a store shift only by another עובד/ת חנות — so the other team never
   // sees (in-app or on the phone) swap requests that aren't relevant to them.
-  const peers = employees.filter(e => e.active && e.roleId === requester.roleId && e.id !== requesterId);
+  // ...and not "night only" colleagues for a day shift, since they couldn't take it anyway.
+  const peers = employees.filter(e => e.active && e.roleId === requester.roleId && e.id !== requesterId &&
+    !(e.nightOnly && !S.isNightTemplate(template)));
 
   const swapId = await store.createSwapRequest({ assignmentId, requesterId, roleId: requester.roleId, kind });
 
@@ -239,6 +349,10 @@ async function claimSwapRequest(store, { swapId, claimerId }) {
     const clash = nearby.some(a => a.employeeId === claimerId && templatesById[a.shiftTemplateId] &&
       overlaps(start, end, S.shiftStartTs(a, templatesById), S.shiftEndTs(a, templatesById)));
     if (clash) throw new Error('overlap');
+    // The manager's night rules apply to swaps too — only the manager can make an exception.
+    const warnings = await ruleWarnings(store, claimer, template, assignment.date);
+    if (warnings.includes('night_only')) throw new Error('night_only');
+    if (warnings.includes('after_night')) throw new Error('after_night');
   }
 
   if (!(await store.claimOpenSwapRequest(swapId, claimerId))) throw new Error('not_open'); // someone else was faster
@@ -286,7 +400,7 @@ async function cancelSwapRequest(store, { swapId, requesterId }) {
 // taken away by hand never goes unnoticed. Shifts already in the past are edited silently —
 // that's the manager fixing history for the hours report, not news for the employee.
 
-async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeId }) {
+async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeId, override }) {
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || S.weekKeyOf(date) !== weekStart) throw new Error('invalid_date');
   const [templates, employee, availRows, settings, week] = await Promise.all([
     store.listShiftTemplates(), store.getEmployee(employeeId),
@@ -298,6 +412,15 @@ async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeI
   if (!employee || !employee.active) throw new Error('invalid_employee');
   if (week && week.assignments.some(a => a.date === date && a.shiftTemplateId === shiftTemplateId && a.employeeId === employeeId)) {
     throw new Error('already_assigned');
+  }
+
+  // Breaking one of the manager's own rules (night only / after a night / set number of shifts)
+  // is allowed by hand — but only once the manager has seen the warning and confirmed.
+  const warnings = await ruleWarnings(store, employee, template, date, { checkQuota: true });
+  if (warnings.length && !override) {
+    const err = new Error('needs_confirmation');
+    err.warnings = warnings;
+    throw err;
   }
 
   const bucket = S.timeBucketOf(template);
@@ -320,8 +443,9 @@ async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeI
       text: 'שובצת למשמרת: ' + desc + '.',
       tag: 'shift-' + id, url: '/?tab=myschedule',
     });
+    queueTeamChange(store, weekStart, template.roleId, employee.name + ' שובץ/ה ל' + desc);
   }
-  return { id, constraintConflict, notified };
+  return { id, constraintConflict, notified, warnings };
 }
 
 async function manualRemove(store, assignmentId) {
@@ -329,6 +453,7 @@ async function manualRemove(store, assignmentId) {
   if (!assignment) throw new Error('not_found');
   const [templates, settings] = await Promise.all([store.listShiftTemplates(), store.getSettings()]);
   const template = templates.find(t => t.id === assignment.shiftTemplateId);
+  const employee = await store.getEmployee(assignment.employeeId);
   await store.removeAssignment(assignmentId);
   const droppedSwaps = await store.deleteOpenSwapsForAssignment(assignmentId);
   await retractSwapOffers(store, droppedSwaps);
@@ -339,8 +464,9 @@ async function manualRemove(store, assignmentId) {
       text: 'הוסרת מהמשמרת: ' + shiftDesc(template, assignment.date) + '.',
       severity: 'warning', tag: 'shift-' + assignmentId, url: '/?tab=myschedule',
     });
+    if (template) queueTeamChange(store, assignment.weekStart, template.roleId, (employee ? employee.name : '?') + ' הוסר/ה מ' + shiftDesc(template, assignment.date));
   }
   return { notified };
 }
 
-module.exports = { generateWeek, openSwapRequest, claimSwapRequest, cancelSwapRequest, manualAssign, manualRemove };
+module.exports = { generateWeek, openSwapRequest, claimSwapRequest, cancelSwapRequest, manualAssign, manualRemove, flushTeamChanges, setTeamChangeDelay };

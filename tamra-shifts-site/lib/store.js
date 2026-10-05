@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS employees (
   max_shifts_per_week INTEGER,
   gender TEXT,
   is_senior INTEGER NOT NULL DEFAULT 0,
+  night_only INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shift_templates (
@@ -189,7 +190,13 @@ const DEFAULT_TEMPLATES = [
 // Safe to run every startup: each statement is a no-op once already applied, and each is
 // isolated so a failure on one can't block the rest.
 async function migrateTimestampColumns(db) {
-  if (db.dialect !== 'postgres') return;
+  if (db.dialect !== 'postgres') {
+    // SQLite (local dev databases on disk): only the newest column needs patching in — SQLite has
+    // no "ADD COLUMN IF NOT EXISTS", so check first.
+    const cols = await db.all('PRAGMA table_info(employees)', []);
+    if (!cols.some(c => c.name === 'night_only')) await db.exec('ALTER TABLE employees ADD COLUMN night_only INTEGER NOT NULL DEFAULT 0');
+    return;
+  }
   const alters = [
     'ALTER TABLE employees ALTER COLUMN created_at TYPE BIGINT',
     'ALTER TABLE schedules ALTER COLUMN generated_at TYPE BIGINT',
@@ -204,6 +211,7 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS required_gender TEXT',
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS allow_extra INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_senior INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE employees ADD COLUMN IF NOT EXISTS night_only INTEGER NOT NULL DEFAULT 0',
     // --- multi-tenant migration: every pre-existing row belongs to the original company ---
     "ALTER TABLE settings ADD COLUMN IF NOT EXISTS company_id TEXT NOT NULL DEFAULT 'tamra'",
     "ALTER TABLE employees ADD COLUMN IF NOT EXISTS company_id TEXT NOT NULL DEFAULT 'tamra'",
@@ -408,7 +416,11 @@ function rowToEmployee(r, includePin) {
   const isSeniorManual = !!r.is_senior;
   const e = {
     id: r.id, name: r.name, roleId: r.role_id, active: !!r.active,
+    // maxShiftsPerWeek: the exact number of shifts the manager wants this employee to get per
+    // week (1-7) — the generator never gives more and tries hard to give exactly that many.
+    // null = flexible (no fixed number, shifts are shared out fairly by hours).
     maxShiftsPerWeek: r.max_shifts_per_week || null, gender: r.gender || null,
+    nightOnly: !!r.night_only, // auto-generation only puts them on night shifts
     createdAt: createdAt, isSeniorManual: isSeniorManual,
     isSenior: S.isEffectivelySenior({ isSeniorManual: isSeniorManual, roleId: r.role_id, createdAt: createdAt }),
   };
@@ -471,11 +483,11 @@ function makeStore(db, companyId) {
       const row = await db.get('SELECT * FROM employees WHERE id = ? AND pin = ? AND active = 1 AND company_id = ?', [id, pin, cid]);
       return row ? rowToEmployee(row, true) : null;
     },
-    async createEmployee({ name, roleId, pin, maxShiftsPerWeek, gender, isSenior }) {
+    async createEmployee({ name, roleId, pin, maxShiftsPerWeek, gender, isSenior, nightOnly }) {
       const id = uid();
       await db.run(
-        'INSERT INTO employees (id, company_id, name, role_id, pin, active, max_shifts_per_week, gender, is_senior, created_at) VALUES (?,?,?,?,?,1,?,?,?,?)',
-        [id, cid, name, roleId, pin, maxShiftsPerWeek || null, gender || null, isSenior ? 1 : 0, Date.now()]
+        'INSERT INTO employees (id, company_id, name, role_id, pin, active, max_shifts_per_week, gender, is_senior, night_only, created_at) VALUES (?,?,?,?,?,1,?,?,?,?,?)',
+        [id, cid, name, roleId, pin, maxShiftsPerWeek || null, gender || null, isSenior ? 1 : 0, nightOnly ? 1 : 0, Date.now()]
       );
       return this.getEmployee(id);
     },
@@ -490,9 +502,10 @@ function makeStore(db, companyId) {
         max_shifts_per_week: patch.maxShiftsPerWeek !== undefined ? patch.maxShiftsPerWeek : cur.max_shifts_per_week,
         gender: patch.gender != null ? patch.gender : cur.gender,
         is_senior: patch.isSenior != null ? (patch.isSenior ? 1 : 0) : cur.is_senior,
+        night_only: patch.nightOnly != null ? (patch.nightOnly ? 1 : 0) : (cur.night_only ? 1 : 0),
       };
-      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=?, gender=?, is_senior=? WHERE id=? AND company_id=?',
-        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, next.gender, next.is_senior, id, cid]);
+      await db.run('UPDATE employees SET name=?, role_id=?, pin=?, active=?, max_shifts_per_week=?, gender=?, is_senior=?, night_only=? WHERE id=? AND company_id=?',
+        [next.name, next.role_id, next.pin, next.active, next.max_shifts_per_week, next.gender, next.is_senior, next.night_only, id, cid]);
       return this.getEmployee(id);
     },
 
