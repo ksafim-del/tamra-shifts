@@ -50,9 +50,9 @@ function genderClass(g){ return g==='male'?'gender-male':(g==='female'?'gender-f
 
 /* ---------- app state ---------- */
 var STATE = null; // { session, me, settings, employees, shiftTemplates }
-var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
+var CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null, availWeek:{} };
 var PUBLIC_EMPLOYEES = []; // populated pre-login so the employee login dropdown works without auth
-var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine', pushSupported:null, pushSubscribed:false, pushBusy:false, pushPermission:null };
+var ui = { tab:null, loginMode:'employee', loginErr:'', currentWeek: weekKeyOf(todayStr()), currentMonth: monthKeyOf(new Date()), modal:null, busy:false, scheduleRole:'fuel', truthBusy:false, truthError:'', employeesGender:'all', myScheduleView:'mine', pushSupported:null, pushSubscribed:false, pushBusy:false, pushPermission:null, hideAvailPanel: lsGet('hideAvailPanel') === '1' };
 var SEEN_NOTIF_IDS = null; // ids already known to this tab — anything new after the first load gets a toast
 
 // Tabs that exist per session type (also used to validate a ?tab= link from a push notification).
@@ -108,10 +108,13 @@ function boot() {
 // A tapped push notification opens the app at e.g. "/?tab=myswaps" — jump straight to that tab,
 // then tidy the address bar so a later reload doesn't keep forcing it.
 function tabFromUrl() {
-  var m = /[?&]tab=([a-z]+)/.exec(window.location.search || '');
-  if (!m) return null;
+  var q = window.location.search || '';
+  var m = /[?&]tab=([a-z]+)/.exec(q);
+  var w = /[?&]week=(\d{4}-\d{2}-\d{2})/.exec(q);
+  if (w) ui.currentWeek = weekKeyOf(w[1]); // e.g. "the schedule for week X is waiting for approval"
+  if (!m && !w) return null;
   try { window.history.replaceState(null, '', window.location.pathname); } catch (e) { /* ignore */ }
-  return m[1];
+  return m ? m[1] : null;
 }
 
 /* ---------- push notifications (see lib/push.js + public/sw.js) ---------- */
@@ -207,7 +210,7 @@ function unbindPushDevice() {
 // manager session — the employee list with PINs), so the next person on this device starts clean.
 function resetClientState() {
   STATE = null; ui.tab = null; ui.modal = null;
-  CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null };
+  CACHE = { weeks:{}, availability:null, swaps:null, notifications:null, hours:{}, employeesFull:null, truthHours:null, availWeek:{} };
   SEEN_NOTIF_IDS = null; _lastEnsuredTab = null; setAppBadge(0);
 }
 function logout() {
@@ -228,6 +231,15 @@ function loadWeek(wk, cb) {
 function loadAvailability(cb) {
   var target = nextGenerationWeek();
   api('GET', '/api/availability?weekStart=' + target).then(function (r) { if (r.ok) CACHE.availability = r.data.availability; if (cb) cb(); render(); });
+}
+// The availability every employee submitted for one week (manager: everyone's) — shown on the
+// schedule tab while building/approving that week.
+function loadAvailWeek(wk) {
+  CACHE.availWeek[wk] = CACHE.availWeek[wk] || 'loading';
+  api('GET', '/api/availability?weekStart=' + wk).then(function (r) {
+    CACHE.availWeek[wk] = r.ok ? r.data.availability : [];
+    if (!isUserEditing()) render();
+  });
 }
 function loadSwaps(cb) {
   // fetch full history (not just open) so resolved requests still show who claimed them
@@ -309,7 +321,7 @@ function loadEmployeesFull(cb) {
   api('GET', '/api/employees').then(function (r) { if (r.ok) CACHE.employeesFull = r.data.employees; if (cb) cb(); render(); });
 }
 function refreshBootstrapEmployees() {
-  api('GET', '/api/bootstrap').then(function (r) { if (r.ok) { STATE.employees = r.data.employees; STATE.shiftTemplates = r.data.shiftTemplates; render(); } });
+  api('GET', '/api/bootstrap').then(function (r) { if (r.ok) { STATE.employees = r.data.employees; STATE.shiftTemplates = r.data.shiftTemplates; STATE.draftWeeks = r.data.draftWeeks; if (!isUserEditing()) render(); } });
 }
 
 /* ---------- true-hours (.xlsx) upload ---------- */
@@ -368,24 +380,25 @@ function handleAction(action, el, ev) {
   if (action === 'month-next') { ui.currentMonth = addMonths(ui.currentMonth, 1); render(); loadHours(ui.currentMonth); return; }
 
   if (action === 'generate-schedule') { ui.modal = { type: 'confirm-generate' }; render(); return; }
-  if (action === 'confirm-generate-go') {
+  if (action === 'confirm-generate-go') { closeModal(); runGenerate({}); return; }
+  if (action === 'regenerate-force') { ui.modal = { type: 'confirm-regenerate' }; render(); return; }
+  if (action === 'regenerate-keep') { closeModal(); runGenerate({ force: true, keepManual: true }); return; }
+  if (action === 'regenerate-scratch') { closeModal(); runGenerate({ force: true }); return; }
+  if (action === 'publish-week') { ui.modal = { type: 'confirm-publish' }; render(); return; }
+  if (action === 'confirm-publish-go') {
     closeModal();
-    api('POST', '/api/schedule/' + ui.currentWeek + '/generate', {}).then(function (r) {
-      if (!r.ok) { toast('שגיאה בהפקת הלוז', 'err'); return; }
-      if (r.data.skipped) toast('כבר קיים לוז לשבוע זה', 'err');
-      else toast(r.data.week.understaffed.length ? ('הלוז הופק — ' + r.data.week.understaffed.length + ' משמרות לא מאוישות') : 'הלוז הופק בהצלחה, הכול מאויש', r.data.week.understaffed.length ? 'err' : 'ok');
-      CACHE.weeks[ui.currentWeek] = r.data.week;
+    var pubWk = ui.currentWeek;
+    api('POST', '/api/schedule/' + pubWk + '/publish').then(function (r) {
+      if (!r.ok) { toast('שגיאה באישור הלוז', 'err'); return; }
+      CACHE.weeks[pubWk] = r.data.week;
+      toast('✅ הלוז אושר ופורסם ל-' + r.data.employees + ' עובדים', 'ok');
+      refreshBootstrapEmployees();
       render();
     });
     return;
   }
-  if (action === 'regenerate-force') {
-    closeModal();
-    api('POST', '/api/schedule/' + ui.currentWeek + '/generate', { force: true }).then(function (r) {
-      if (r.ok) { CACHE.weeks[ui.currentWeek] = r.data.week; toast('הלוז הופק מחדש', 'ok'); render(); }
-    });
-    return;
-  }
+  if (action === 'goto-week') { ui.tab = 'schedule'; ui.currentWeek = el.getAttribute('data-week'); ui.modal = null; render(); loadWeek(ui.currentWeek); return; }
+  if (action === 'toggle-avail-panel') { ui.hideAvailPanel = !ui.hideAvailPanel; lsSet('hideAvailPanel', ui.hideAvailPanel ? '1' : ''); render(); return; }
   if (action === 'remove-assignment') {
     ui.modal = { type: 'confirm-remove', aid: el.getAttribute('data-aid') }; render(); return;
   }
@@ -491,6 +504,20 @@ function handleAction(action, el, ev) {
     return;
   }
   if (action === 'clear-truth-hours') { CACHE.truthHours = null; ui.truthError = ''; render(); return; }
+}
+
+// Generates the current week as a draft (only the manager sees it until it's approved).
+function runGenerate(body) {
+  var genWk = ui.currentWeek;
+  api('POST', '/api/schedule/' + genWk + '/generate', body).then(function (r) {
+    if (!r.ok) { toast('שגיאה בהפקת הלוז', 'err'); return; }
+    if (r.data.skipped) { toast('כבר קיים לוז לשבוע זה', 'err'); return; }
+    var miss = r.data.week.understaffed.length;
+    toast('📝 הלוז הופק כטיוטה' + (miss ? (' — ' + miss + ' משמרות לא מאוישות') : '') + '. בדוק/י, שנה/י אם צריך, ואשר/י כדי שהעובדים יראו אותו.', miss ? 'err' : 'ok');
+    CACHE.weeks[genWk] = r.data.week;
+    refreshBootstrapEmployees();
+    render();
+  });
 }
 
 // Manual assignment. If it breaks one of the manager's own rules (night only / day after a
@@ -688,7 +715,8 @@ setInterval(function () {
   if (ui.modal || isUserEditing()) return;
   var tab = ui.tab;
   if (tab === 'schedule' || tab === 'myschedule') loadWeek(ui.currentWeek);
-  if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); }
+  if (tab === 'schedule') loadAvailWeek(ui.currentWeek);
+  if (tab === 'overview') { loadWeek(weekKeyOf(todayStr())); loadSwaps(); refreshBootstrapEmployees(); }
   if (tab === 'requests') { loadSwaps(); loadAvailability(); }
   if (tab === 'myswaps') loadSwaps();
 }, LIVE_POLL_MS);
@@ -815,6 +843,10 @@ function overviewHtml() {
   if (String(STATE.settings.managerPin) === '1234') {
     html += '<div class="banner err" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;"><div><b>קוד הכניסה של המנהל/ת הוא עדיין קוד ברירת המחדל (1234).</b> כל מי שמנחש אותו יכול להיכנס כמנהל/ת — מומלץ מאוד להחליף אותו.</div><button class="btn sm" data-action="set-tab" data-tab="settings">להחלפת הקוד</button></div>';
   }
+  (STATE.draftWeeks || []).forEach(function (dw) {
+    html += '<div class="status-bar draft"><div>📝 <b>הלוז לשבוע ' + weekLabel(dw) + ' ממתין לאישור שלך</b><div class="status-sub">העובדים עדיין לא רואים אותו.</div></div>'
+      + '<button class="btn sm" data-action="goto-week" data-week="' + dw + '">לצפייה ואישור</button></div>';
+  });
   if (!STATE.employees.length) {
     html += '<div class="card"><div class="card-head"><h2>ברוכים הבאים ללוח המשמרות</h2></div>'
       + '<div class="helpcard"><b>איך מתחילים:</b><ol>'
@@ -951,6 +983,20 @@ function scheduleHtml() {
     + '<div class="helpcard">הפקת הלוז מיועדת ליום חמישי, לשבוע המתחיל ' + weekLabel(nextGenerationWeek()) + '. הגשת אילוצי עובדים לשבוע זה ננעלת ביום רביעי ' + fmtDateShort(deadline) + ' בשעה 23:59.</div>';
 
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
+  if (CACHE.availWeek[wk] === undefined) loadAvailWeek(wk);
+  var availList = Array.isArray(CACHE.availWeek[wk]) ? CACHE.availWeek[wk] : [];
+  var availBy = {};
+  availList.forEach(function (a) { availBy[a.employeeId + '|' + a.date] = a.choice; });
+
+  // Draft / published status — employees only see the week once it's approved.
+  if (week.assignments.length) {
+    if (week.published) {
+      html += '<div class="status-bar published"><div>✅ <b>הלוז פורסם לעובדים</b>' + (week.publishedAt ? ' <span class="status-sub">(' + esc(new Date(week.publishedAt).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })) + ')</span>' : '') + '<div class="status-sub">שינויים ידניים מעכשיו נשלחים לעובדים כהודעה.</div></div></div>';
+    } else {
+      html += '<div class="status-bar draft"><div>📝 <b>טיוטה — העובדים עדיין לא רואים את הלוז הזה.</b><div class="status-sub">אפשר לשנות ידנית (בלי שהעובדים יקבלו הודעות), ובסוף לאשר.</div></div>'
+        + '<button class="btn" data-action="publish-week">✅ אישור ופרסום לעובדים</button></div>';
+    }
+  }
 
   var roleUnderstaffed = week.understaffed.filter(function (u) {
     var t = STATE.shiftTemplates.find(function (tt) { return tt.id === u.shiftTemplateId; });
@@ -971,9 +1017,29 @@ function scheduleHtml() {
     }).join('') + '</div>';
   }
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
-    + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">הפק מחדש (דורס)</button>' : '<button class="btn" data-action="generate-schedule">הפק לוז</button>')
+    + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">🔄 הפק מחדש</button>'
+        : ('<button class="btn" data-action="generate-schedule">' + (week.assignments.length ? 'הפק לוז (משלים סביב השיבוצים הידניים)' : 'הפק לוז') + '</button>'))
     + (week.generatedAt ? ('<a class="btn secondary sm" href="/api/schedule/' + wk + '/export.xlsx" download>⬇️ ייצוא לאקסל</a>') : '')
     + '</div></div>';
+
+  // What the team submitted for this week — the basis for any manual decision.
+  html += '<div class="card"><div class="card-head"><h2>הזמינות ש' + esc(roleTeamPhrase(roleFilter).replace('כל ', '')) + ' הגישו לשבוע הזה</h2>'
+    + '<button class="btn secondary sm" data-action="toggle-avail-panel">' + (ui.hideAvailPanel ? 'הצג' : 'הסתר') + '</button></div>';
+  if (!ui.hideAvailPanel) {
+    if (CACHE.availWeek[wk] === 'loading' || CACHE.availWeek[wk] === undefined) html += '<div class="empty">טוען…</div>';
+    else if (!teamEmps.length) html += '<div class="empty">אין עובדים פעילים</div>';
+    else {
+      var days7 = [0, 1, 2, 3, 4, 5, 6].map(function (d) { return addDays(wk, d); });
+      var submitted = teamEmps.filter(function (e) { return days7.some(function (ds) { return availBy[e.id + '|' + ds]; }); }).length;
+      html += '<div class="status-sub" style="margin-bottom:8px;">הגישו ' + submitted + ' מתוך ' + teamEmps.length + ' (מי שלא הגיש/ה נחשב/ת זמין/ה כל השבוע).</div>'
+        + '<div class="table-scroll"><table class="xltable"><thead><tr><th>עובד/ת</th>' + days7.map(function (ds) {
+          return '<th style="white-space:nowrap;">' + dowName(dowOfDateStr(ds)) + '<br><span class="mono" style="font-weight:400;">' + fmtDateShort(ds) + '</span></th>';
+        }).join('') + '</tr></thead><tbody>' + teamEmps.map(function (e) {
+          return '<tr><td style="white-space:nowrap;">' + esc(e.name) + (e.nightOnly ? ' 🌙' : '') + '</td>' + days7.map(function (ds) { return '<td>' + availPillHtml(availBy[e.id + '|' + ds]) + '</td>'; }).join('') + '</tr>';
+        }).join('') + '</tbody></table></div>';
+    }
+  }
+  html += '</div>';
 
   html += '<div class="card"><div class="calgrid">' + [0,1,2,3,4,5,6].map(function (d) {
     var ds = addDays(wk, d);
@@ -995,12 +1061,12 @@ function scheduleHtml() {
           + '<div class="cal-time mono">' + t.start + '–' + t.end + '</div>'
           + '<div class="cal-emps">' + assigned.map(function (a) {
               var emp = STATE.employees.find(function (e) { return e.id === a.employeeId; });
-              return '<span class="cal-chip">' + esc(emp ? emp.name : '?') + (emp && emp.isSenior ? ' ⭐' : '') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
+              return '<span class="cal-chip"' + (a.manual ? ' title="שובץ/ה ידנית — נשמר/ת בהפקה מחדש"' : '') + '>' + (a.manual ? '✋ ' : '') + esc(emp ? emp.name : '?') + (emp && emp.isSenior ? ' ⭐' : '') + ' <button data-action="remove-assignment" data-aid="' + a.id + '">✕</button></span>';
             }).join('')
           + (missing > 0 && !manualOnly ? '<span class="cal-chip understaffed">חסר ' + missing + '</span>' : '')
           + (seniorIssue ? '<span class="cal-chip understaffed">אין ותיק/ה</span>' : '')
           + '</div>'
-          + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){var tg=shiftTargetOf(e);return '<option value="'+e.id+'">'+esc(e.name)+(e.nightOnly?' 🌙':'')+' ('+(weekCount[e.id]||0)+(tg!=null?'/'+tg:'')+')</option>';}).join('') + '</select>') : '')
+          + (canAddMore ? ('<select data-action="assign-slot" data-date="' + ds + '" data-tid="' + t.id + '"><option value="">+ שיבוץ ידני</option>' + STATE.employees.filter(function(e){return e.active && e.roleId===t.roleId;}).map(function(e){var tg=shiftTargetOf(e);return '<option value="'+e.id+'">'+availMark(availBy[e.id+'|'+ds], t)+' '+esc(e.name)+(e.nightOnly?' 🌙':'')+' ('+(weekCount[e.id]||0)+(tg!=null?'/'+tg:'')+')</option>';}).join('') + '</select>') : '')
           + '</div>';
       }).join('');
     }
@@ -1061,6 +1127,16 @@ function availPillHtml(choice) {
   var labels = { all: 'כל היום', morning: 'בוקר', noon: 'צהריים', night: 'לילה', none: 'לא זמין/ה' };
   if (!choice) return '<span class="pill" title="לא הוגשה זמינות">—</span>';
   return '<span class="pill avail-' + choice + '">' + (labels[choice] || choice) + '</span>';
+}
+// In the manual-assign dropdown: did this person say they can work this shift?
+// ✓ yes · ✗ no (they marked another part of the day, or "can't") · ? didn't submit (= available)
+function availMark(choice, t) {
+  if (!choice) return '?';
+  var start = timeToMinutes(t.start);
+  var bucket = t.label && t.label.indexOf('ביניים') !== -1 ? 'all' : (start < 720 ? 'morning' : (start < 1020 ? 'noon' : 'night'));
+  if (choice === 'all') return '✓';
+  if (choice === 'none') return '✗';
+  return choice === bucket ? '✓' : '✗';
 }
 function availabilityGridHtml() {
   var target = nextGenerationWeek();
@@ -1262,7 +1338,7 @@ function myScheduleHtml() {
     + '<button class="btn ' + (viewAll ? '' : 'secondary') + ' sm" data-action="toggle-my-schedule-view">' + (viewAll ? '👤 הלוז שלי' : '👥 לוז ' + roleTeamPhrase(STATE.me.roleId)) + '</button>'
     + '</div></div>';
   if (!week) { html += '<div class="empty">טוען…</div></div>'; return html; }
-  if (!week.generatedAt && !week.assignments.length) { html += '<div class="empty">הלוז לשבוע זה עדיין לא הופק</div></div>'; return html; }
+  if (!week.published || !week.assignments.length) { html += '<div class="empty">הלוז לשבוע זה עדיין לא פורסם</div></div>'; return html; }
 
   if (viewAll) { html += teamScheduleHtml(wk, week) + '</div>'; return html; }
 
@@ -1378,7 +1454,10 @@ function modalHtml() {
   var m = ui.modal;
   var inner = '';
   if (m.type === 'confirm-generate') {
-    inner = '<h3>הפקת לוז לשבוע ' + weekLabel(ui.currentWeek) + '</h3><p>המערכת תשבץ אוטומטית את כל העובדים הפעילים לפי האילוצים שהוגשו, חלוקה הוגנת, וללא שתי משמרות תוך 24 שעות. אפשר לערוך ידנית אחר כך.</p>'
+    var hasManual = CACHE.weeks[ui.currentWeek] && CACHE.weeks[ui.currentWeek].assignments.length;
+    inner = '<h3>הפקת לוז לשבוע ' + weekLabel(ui.currentWeek) + '</h3><p>המערכת תשבץ אוטומטית את העובדים לפי הזמינות שהגישו, מספר המשמרות שהוגדר לכל אחד והכללים.'
+      + (hasManual ? ' <b>השיבוצים הידניים שכבר עשית יישארו בדיוק כמו שהם</b>, והמערכת תשלים סביבם.' : '') + '</p>'
+      + '<p>📝 הלוז יופק <b>כטיוטה</b> — רק את/ה רואה אותו. אחרי שתבדוק/י ותשנה/י מה שצריך, לוחצים "אישור ופרסום" והוא יופיע לעובדים.</p>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" id="confirm-generate-go" data-action="confirm-generate-go">הפק לוז</button></div>';
   } else if (m.type === 'employee-form') {
     var e = m.employee;
@@ -1407,6 +1486,32 @@ function modalHtml() {
         }).join('') + '</div></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;"><button type="button" class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" type="submit">שמירה</button></div>'
       + '</form>';
+  } else if (m.type === 'confirm-regenerate') {
+    var wR = CACHE.weeks[ui.currentWeek];
+    var manualCount = wR ? wR.assignments.filter(function (a) { return a.manual; }).length : 0;
+    inner = '<h3>הפקה מחדש — ' + weekLabel(ui.currentWeek) + '</h3>'
+      + (wR && wR.published ? '<div class="banner warn">הלוז הזה כבר פורסם לעובדים. אחרי ההפקה מחדש הוא יחזור להיות טיוטה — העובדים לא יראו את השבוע הזה עד שתאשר/י אותו שוב.</div>' : '')
+      + '<p>' + (manualCount ? ('יש בשבוע הזה ' + manualCount + ' שיבוצים שעשית ידנית (מסומנים ✋).') : 'אין בשבוע הזה שיבוצים ידניים.') + '</p>'
+      + '<div style="display:flex;flex-direction:column;gap:8px;">'
+      + '<button class="btn" data-action="regenerate-keep">הפק מחדש ושמור את השיבוצים הידניים שלי</button>'
+      + '<button class="btn secondary" data-action="regenerate-scratch">הפק מחדש מאפס (גם השיבוצים הידניים יוחלפו)</button>'
+      + '<button class="btn secondary" data-action="close-modal">ביטול</button></div>';
+  } else if (m.type === 'confirm-publish') {
+    var wP = CACHE.weeks[ui.currentWeek];
+    var missP = 0;
+    if (wP) STATE.shiftTemplates.forEach(function (t) {
+      if (!t.active || t.autoAssign === false) return;
+      for (var dd = 0; dd < 7; dd++) {
+        var dds = addDays(ui.currentWeek, dd);
+        if (t.days.indexOf(dowOfDateStr(dds)) === -1) continue;
+        var n = wP.assignments.filter(function (a) { return a.date === dds && a.shiftTemplateId === t.id; }).length;
+        if (n < t.needed) missP += t.needed - n;
+      }
+    });
+    inner = '<h3>אישור ופרסום הלוז — ' + weekLabel(ui.currentWeek) + '</h3>'
+      + '<p>אחרי האישור כל העובדים יראו את הלוז של השבוע הזה, ויקבלו הודעה (באתר ובטלפון) כמה משמרות יש להם.</p>'
+      + (missP ? '<div class="banner warn">שים/י לב: עדיין ' + missP + ' משמרות לא מאוישות. אפשר לאשר בכל זאת ולהשלים אחר כך.</div>' : '')
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn secondary" data-action="close-modal">ביטול</button><button class="btn" data-action="confirm-publish-go">✅ אישור ופרסום</button></div>';
   } else if (m.type === 'confirm-assign') {
     var tA = STATE.shiftTemplates.find(function (tt) { return tt.id === m.tid; });
     var eA = STATE.employees.find(function (x) { return x.id === m.empId; });
