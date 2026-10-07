@@ -229,7 +229,9 @@ function makeApp(store, opts) {
     };
     let me = null;
     if (session.type === 'employee') { me = await store.getEmployee(session.employeeId); }
-    return sendJson(res, 200, { session, me, settings: publicSettings, employees, shiftTemplates, pushPublicKey: push.getPublicKey() });
+    // Manager: weeks (from this one on) whose schedule is built but still waiting for approval.
+    const draftWeeks = session.type === 'manager' ? await store.listDraftWeeks(S.weekKeyOf(S.todayStr())) : undefined;
+    return sendJson(res, 200, { session, me, settings: publicSettings, employees, shiftTemplates, pushPublicKey: push.getPublicKey(), draftWeeks });
   });
 
   // ---- push notifications (see lib/push.js + public/sw.js) ----
@@ -339,13 +341,28 @@ function makeApp(store, opts) {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
     const week = await store.getScheduleWeek(params.weekStart);
-    return sendJson(res, 200, { week: week || { weekStart: params.weekStart, assignments: [], understaffed: [], seniorIssues: [], generatedAt: null } });
+    const empty = { weekStart: params.weekStart, assignments: [], understaffed: [], seniorIssues: [], generatedAt: null, published: false, publishedAt: null };
+    // Employees only ever see a week once the manager has approved (published) it.
+    if (session.type !== 'manager' && (!week || !week.published)) return sendJson(res, 200, { week: empty });
+    return sendJson(res, 200, { week: week || empty });
   });
   route('POST', '/api/schedule/:weekStart/generate', async (req, res, params, body) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
-    const result = await actions.generateWeek(store, params.weekStart, { force: !!(body && body.force) });
+    const result = await actions.generateWeek(store, params.weekStart, { force: !!(body && body.force), keepManual: !!(body && body.keepManual) });
     return sendJson(res, 200, result);
+  });
+  // The manager approves the week's schedule — only now do employees see it (and get told).
+  route('POST', '/api/schedule/:weekStart/publish', async (req, res, params) => {
+    const session = await requireSession(req);
+    if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
+    try {
+      const result = await actions.publishWeek(store, params.weekStart);
+      return sendJson(res, 200, Object.assign(result, { week: await store.getScheduleWeek(params.weekStart) }));
+    } catch (e) {
+      if (e.message === 'empty_week') return sendJson(res, 400, { error: e.message });
+      throw e;
+    }
   });
   route('GET', '/api/schedule/:weekStart/export.xlsx', async (req, res, params) => {
     const session = await requireSession(req);
@@ -522,10 +539,14 @@ function makeApp(store, opts) {
   route('GET', '/api/hours/:monthKey', async (req, res, params) => {
     const session = await requireSession(req);
     if (!session) return sendJson(res, 401, { error: 'not_authenticated' });
-    const [assignments, shiftTemplates, settings] = await Promise.all([
+    let [assignments, shiftTemplates, settings] = await Promise.all([
       store.listAssignmentsInRange(params.monthKey + '-01', params.monthKey + '-31'),
       store.listShiftTemplates(), store.getSettings(),
     ]);
+    if (session.type === 'employee') { // drafts the manager hasn't approved yet don't count for employees
+      const published = new Set(await store.listPublishedWeeks());
+      assignments = assignments.filter(a => published.has(a.weekStart));
+    }
     const templatesById = {}; shiftTemplates.forEach(t => templatesById[t.id] = t);
     let result = S.computeMonthlyHours(params.monthKey, assignments, templatesById, settings);
     if (session.type === 'employee') {

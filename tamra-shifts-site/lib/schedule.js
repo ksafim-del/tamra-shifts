@@ -209,7 +209,7 @@ const CHAIN_SEARCH_BUDGET = 3000; // rule checks one repair search may spend bef
 
 /**
  * @param {string} weekStart Sunday YYYY-MM-DD
- * @param {object} data { employees, shiftTemplates, availability, meta, priorAssignments, followingAssignments }
+ * @param {object} data { employees, shiftTemplates, availability, meta, priorAssignments, followingAssignments, fixedAssignments }
  *   availability: this week's submitted picks, each { employeeId, date, choice }. An employee/date
  *   combination with no entry defaults to 'all' (available) — the mandatory-selection rule is
  *   enforced at submission time (the UI won't let someone send an incomplete week), not here, so a
@@ -217,6 +217,10 @@ const CHAIN_SEARCH_BUDGET = 3000; // rule checks one repair search may spend bef
  *   priorAssignments / followingAssignments: assignments of the week before / the week after
  *   (when they exist), for the rest and night rules across the week boundary. Each must carry a
  *   precomputed _startTs (ms).
+ *   fixedAssignments: this week's shifts the manager placed by hand and wants kept — they stay
+ *   exactly as they are (even if they break a rule — that was the manager's call), count towards
+ *   each person's number of shifts and rest/night rules, and the generator fills around them.
+ *   They are NOT included in the returned `assignments` (they're already saved).
  *
  * Rules, strongest first — the generator never breaks a rule to satisfy one below it:
  *   1. hard rules: the employee's role/gender, their submitted availability, minimum rest between
@@ -234,6 +238,7 @@ function generateSchedule(weekStart, data) {
   const { employees, shiftTemplates, meta } = data;
   const availability = data.availability || [];
   const outside = (data.priorAssignments || []).concat(data.followingAssignments || []);
+  const fixedAssignments = data.fixedAssignments || [];
   const restMs = (meta.minRestHours || 24) * 3600000;
   const templatesById = {};
   shiftTemplates.forEach(function (t) { templatesById[t.id] = t; });
@@ -270,6 +275,24 @@ function generateSchedule(weekStart, data) {
     for (let i = slots.length - 1; i >= 0; i--) arr[i] = arr[i + 1] + (eligibleSet[i][e.id] ? 1 : 0);
     remainingFrom[e.id] = arr;
   });
+  // The manager's kept shifts: those on a slot the generator fills are pinned onto that slot;
+  // any other (e.g. on a manual-only shift type) still counts for rest/night rules and the
+  // person's number of shifts.
+  const fixedBySlot = slots.map(function () { return []; });
+  const fixedOutsideCount = {};
+  const activeById = {};
+  active.forEach(function (e) { activeById[e.id] = e; });
+  fixedAssignments.forEach(function (a) {
+    const e = activeById[a.employeeId];
+    if (!e) return;
+    const i = slots.findIndex(function (s) { return s.ds === a.date && s.t.id === a.shiftTemplateId; });
+    if (i !== -1 && fixedBySlot[i].indexOf(e) === -1) { fixedBySlot[i].push(e); return; }
+    const t = templatesById[a.shiftTemplateId];
+    if (t) outside.push({ employeeId: e.id, date: a.date, shiftTemplateId: t.id, _startTs: tsFor(a.date, t.start) });
+    fixedOutsideCount[e.id] = (fixedOutsideCount[e.id] || 0) + 1;
+  });
+  function isFixed(e, i) { return fixedBySlot[i].indexOf(e) !== -1; }
+
   // The neighbouring weeks: shift start times, night dates (last week) and day-shift dates (next week).
   const outsideStarts = {}, outsideNightDates = {}, outsideDayDates = {};
   outside.forEach(function (a) {
@@ -305,7 +328,7 @@ function generateSchedule(weekStart, data) {
   function attempt(run, deadline) {
     const bySlot = slots.map(function () { return []; });
     const slotsOf = {}, hoursTally = {}, countByEmp = {};
-    active.forEach(function (e) { hoursTally[e.id] = 0; countByEmp[e.id] = 0; slotsOf[e.id] = []; });
+    active.forEach(function (e) { hoursTally[e.id] = 0; countByEmp[e.id] = fixedOutsideCount[e.id] || 0; slotsOf[e.id] = []; });
     let checks = 0; // rule checks spent by the current repair search
 
     function tieBreak(slot, e) { return seededRandom(slot.ds + slot.t.id + e.id + (run ? '#' + run : '')); }
@@ -344,9 +367,12 @@ function generateSchedule(weekStart, data) {
       return true;
     }
 
+    // the manager's kept shifts go in first, exactly as they are
+    fixedBySlot.forEach(function (list, i) { list.forEach(function (e) { place(e, i); }); });
+
     // ---- first pass: fill the week slot by slot ----
     slots.forEach(function (slot, i) {
-      const need = slot.t.needed;
+      const need = Math.max(0, slot.t.needed - bySlot[i].length);
       const pool = eligibleBySlot[i].filter(function (e) { return canTake(e, i); });
       // Who gets the slot: first anyone still short of the number of shifts the manager set for
       // them — the one with the fewest spare opportunities left goes first, since they're the
@@ -364,7 +390,7 @@ function generateSchedule(weekStart, data) {
       // pick above didn't include one but a senior was available further down the pool, swap them
       // in — replacing, preferably, someone without a fixed number of shifts (so nobody's set
       // number is put at risk), the one with the most hours so far.
-      if (slot.t.roleId === 'fuel' && chosen.length > 0 && !chosen.some(function (e) { return e.isSenior; })) {
+      if (slot.t.roleId === 'fuel' && chosen.length > 0 && !chosen.concat(bySlot[i]).some(function (e) { return e.isSenior; })) {
         const seniorCandidate = pool.slice(need).find(function (e) { return e.isSenior; });
         if (seniorCandidate) {
           let swapOutIdx = 0;
@@ -383,7 +409,7 @@ function generateSchedule(weekStart, data) {
     // week was the only one who could have helped later). Fix what it can, one safe move at a
     // time — every move strictly reduces the shortfall, so this always ends. ----
     function hasRoom(i) { return bySlot[i].length < slots[i].t.needed; }
-    function flexHolderOf(i, seenEmps) { return bySlot[i].find(function (y) { return targetOf[y.id] == null && !(seenEmps && seenEmps[y.id]); }); }
+    function flexHolderOf(i, seenEmps) { return bySlot[i].find(function (y) { return targetOf[y.id] == null && !isFixed(y, i) && !(seenEmps && seenEmps[y.id]); }); }
     // A chain of moves ending in a free spot: e takes slot A; whoever had A (with a set number of
     // their own) moves to slot B; ... until someone lands in an open slot or bumps an employee
     // without a set number. Limited depth and a budget of rule checks.
@@ -402,7 +428,7 @@ function generateSchedule(weekStart, data) {
       if (depth <= 0) return null;
       for (const i of takeable) {
         for (const x of bySlot[i]) {
-          if (seenEmps[x.id]) continue;
+          if (seenEmps[x.id] || isFixed(x, i)) continue;
           const nextSeen = Object.assign({}, seenSlots); nextSeen[i] = true;
           const sub = findChain(x, i, depth - 1, nextSeen, Object.assign({}, seenEmps));
           if (sub) return sub.concat([{ emp: emp, from: from, to: i }]);
@@ -421,6 +447,7 @@ function generateSchedule(weekStart, data) {
     // Move one of e's own shifts elsewhere if that frees room (e.g. a rest window) for one more.
     function relocateForOneMore(e) {
       for (const k of slotsOf[e.id].slice()) {
+        if (isFixed(e, k)) continue; // the manager's kept shifts never move
         for (let k2 = 0; k2 < slots.length; k2++) {
           if (checks > CHAIN_SEARCH_BUDGET) return false;
           if (k2 === k || !canTake(e, k2, k)) continue;
@@ -470,7 +497,7 @@ function generateSchedule(weekStart, data) {
     const assignments = [], understaffed = [], seniorIssues = [], quotaIssues = [];
     slots.forEach(function (slot, i) {
       const here = bySlot[i];
-      here.forEach(function (e) { assignments.push({ date: slot.ds, shiftTemplateId: slot.t.id, employeeId: e.id, noShow: false }); });
+      here.forEach(function (e) { if (!isFixed(e, i)) assignments.push({ date: slot.ds, shiftTemplateId: slot.t.id, employeeId: e.id, noShow: false }); });
       if (here.length < slot.t.needed) understaffed.push({ date: slot.ds, shiftTemplateId: slot.t.id, missing: slot.t.needed - here.length });
       // Staffed but with no senior at all (none was available) — a real gap, but a different one
       // than being short-handed, so it's tracked and surfaced separately.

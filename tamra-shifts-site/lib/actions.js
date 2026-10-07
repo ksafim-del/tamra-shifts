@@ -141,11 +141,23 @@ async function flushTeamChanges() {
   for (const key of Array.from(pendingTeamChanges.keys())) await sendTeamChange(key);
 }
 
-async function generateWeek(store, weekStart, { force } = {}) {
+// Builds a week's schedule as a DRAFT: only the manager sees it (and is told it's waiting for
+// approval); employees see and hear nothing until the manager approves it with publishWeek.
+//   - a week nobody touched yet: generated from scratch;
+//   - a week the manager started filling in by hand (not generated yet): those shifts are kept
+//     exactly as they are and the generator fills in the rest around them;
+//   - an already generated week: only with force — keepManual keeps the manager's hand-made
+//     changes and regenerates the rest, otherwise everything is regenerated. A week that was
+//     already published goes back to being a draft until approved again.
+async function generateWeek(store, weekStart, { force, keepManual } = {}) {
   const existing = await store.getScheduleWeek(weekStart);
-  if (existing && !force) {
+  if (existing && existing.generatedAt && !force) {
     return { skipped: true, reason: 'already_generated', week: existing };
   }
+  const keep = !existing ? 'none'
+    : !existing.generatedAt ? 'all'           // built by hand so far — keep all of it
+    : keepManual ? 'manual' : 'none';
+  const fixedAssignments = !existing ? [] : existing.assignments.filter(a => keep === 'all' || (keep === 'manual' && a.manual));
   const [employees, shiftTemplates, availability, meta] = await Promise.all([
     store.listEmployees(), store.listShiftTemplates(),
     store.listAvailability({ fromDate: weekStart, toDate: S.addDays(weekStart, 6) }),
@@ -160,12 +172,14 @@ async function generateWeek(store, weekStart, { force } = {}) {
     .filter(a => templatesById[a.shiftTemplateId])
     .map(a => Object.assign({}, a, { _startTs: S.shiftStartTs(a, templatesById) }));
 
-  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, availability, meta, priorAssignments: withStart(priorWeek), followingAssignments: withStart(nextWeek) });
-  dropTeamChanges(store, weekStart); // the whole week is being redone — its pending edit notes are moot
-  await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt);
+  const result = S.generateSchedule(weekStart, { employees, shiftTemplates, availability, meta, priorAssignments: withStart(priorWeek), followingAssignments: withStart(nextWeek), fixedAssignments });
+  dropTeamChanges(store, weekStart); // the week is being redone — its pending edit notes are moot
+  await store.saveGeneratedSchedule(weekStart, result.assignments, result.understaffed, result.generatedAt, { keep });
+  const wasPublished = existing ? existing.published : false;
+  if (wasPublished) await store.unpublishWeek(weekStart); // changed again — back to draft until re-approved
 
-  // Regenerating replaces every assignment row of the week, so any swap request still open for
-  // this week now points at a shift that no longer exists — drop those (and their offers).
+  // Regenerating replaces the week's (generated) assignment rows, so a swap request still open
+  // for one of them now points at a shift that no longer exists — drop those (and their offers).
   const droppedSwaps = await store.deleteOpenSwapsInRange(weekStart, S.addDays(weekStart, 6));
   await retractSwapOffers(store, droppedSwaps);
 
@@ -181,6 +195,7 @@ async function generateWeek(store, weekStart, { force } = {}) {
     });
   }
 
+  const awaiting = ' הלוז ממתין לאישור שלך בלשונית "לוז שבועי" — העובדים יראו אותו רק אחרי האישור.';
   if (result.understaffed.length) {
     // A short, organized summary rather than one line per missing slot — the full breakdown
     // is always visible in the "לוז שבועי" tab itself, so the notification just needs to say
@@ -199,13 +214,13 @@ async function generateWeek(store, weekStart, { force } = {}) {
       .join(', ');
     await store.addNotification({
       audience: 'manager', type: 'understaffed', relatedId: weekStart,
-      text: 'הלוז לשבוע ' + weekStart + ' הופק — ' + totalMissing + ' משמרות ללא איוש (' + breakdown + '). לפירוט מלא: לשונית "לוז שבועי".',
+      text: 'הלוז לשבוע ' + weekStart + ' הופק — ' + totalMissing + ' משמרות ללא איוש (' + breakdown + ').' + awaiting,
       severity: 'warning', channels: ['inapp', 'email'],
     });
   } else {
     await store.addNotification({
       audience: 'manager', type: 'generated', relatedId: weekStart,
-      text: 'הלוז לשבוע ' + weekStart + ' הופק בהצלחה, כל המשמרות מאוישות.',
+      text: 'הלוז לשבוע ' + weekStart + ' הופק, כל המשמרות מאוישות.' + awaiting,
       severity: 'info', channels: ['inapp'],
     });
   }
@@ -223,50 +238,64 @@ async function generateWeek(store, weekStart, { force } = {}) {
     });
   }
 
-  // Every active employee gets a personal "the schedule is out" note in their own התראות tab,
-  // with how many shifts they got — replacing the previous one if this week is regenerated.
-  await store.deleteNotifications({ audience: 'employee', type: 'schedule-published', relatedId: weekStart });
-  const countByEmp = {};
-  result.assignments.forEach(a => { countByEmp[a.employeeId] = (countByEmp[a.employeeId] || 0) + 1; });
-  for (const e of employees.filter(x => x.active)) {
-    const n = countByEmp[e.id] || 0;
-    await store.addNotification({
-      audience: 'employee', employeeId: e.id, type: 'schedule-published', relatedId: weekStart,
-      text: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + (existing ? ' עודכן' : ' פורסם') + ' — ' + (n ? ('שובצת ל-' + n + ' משמרות. לפרטים: לשונית "הלוז שלי".') : 'לא שובצת למשמרות בשבוע הזה.'),
-      severity: 'info', channels: ['inapp'],
-    });
-  }
-
   const settings = meta;
   if (settings.managerEmail) {
     const companyPrefix = settings.companyName ? ('[' + settings.companyName + '] ') : '';
     const subject = companyPrefix + (result.understaffed.length
-      ? 'לוז שבועי הופק עם משמרות חסרות — ' + weekStart
-      : 'לוז שבועי הופק — ' + weekStart);
-    const body = result.understaffed.length
-      ? 'הלוז לשבוע ' + weekStart + ' הופק אוטומטית. יש ' + result.understaffed.length + ' משמרות ללא איוש מלא — יש להיכנס לאתר ולשבץ ידנית.'
-      : 'הלוז לשבוע ' + weekStart + ' הופק אוטומטית וכל המשמרות מאוישות.';
+      ? 'לוז שבועי הופק עם משמרות חסרות — ממתין לאישור — ' + weekStart
+      : 'לוז שבועי הופק — ממתין לאישור — ' + weekStart);
+    const body = (result.understaffed.length
+      ? 'הלוז לשבוע ' + weekStart + ' הופק. יש ' + result.understaffed.length + ' משמרות ללא איוש מלא — יש להיכנס לאתר ולשבץ ידנית.'
+      : 'הלוז לשבוע ' + weekStart + ' הופק וכל המשמרות מאוישות.') + ' העובדים יראו אותו רק אחרי שתאשר/י אותו באתר (לשונית "לוז שבועי").';
     await mailer.sendMail({ to: settings.managerEmail, subject, text: body });
   }
 
-  // Phone push — the manager gets the staffing summary, employees get "go look at your shifts".
+  // Phone push to the manager only — employees hear about it when it's approved (publishWeek).
   // Never lets a push-service hiccup fail the schedule generation, which is already saved.
   await safePush(push.broadcastTo(store, {
     title: pushTitle(settings),
-    body: result.understaffed.length
-      ? ('הלוז לשבוע ' + weekStart + ' הופק — ' + result.understaffed.length + ' משמרות ללא איוש')
-      : ('הלוז לשבוע ' + weekStart + ' הופק בהצלחה, כל המשמרות מאוישות'),
+    body: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + ' מוכן וממתין לאישור שלך'
+      + (result.understaffed.length ? (' (' + result.understaffed.length + ' משמרות ללא איוש)') : ''),
     tag: 'schedule-' + weekStart,
-    url: '/?tab=schedule',
+    url: '/?tab=schedule&week=' + weekStart,
   }, push.toManagers()), 'schedule-generated (manager)');
-  await safePush(push.broadcastTo(store, {
-    title: pushTitle(settings),
-    body: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + (existing ? ' עודכן' : ' פורסם') + ' — אפשר לראות את המשמרות שלך',
-    tag: 'schedule-' + weekStart,
-    url: '/?tab=myschedule',
-  }, push.toEmployees(employees.filter(e => e.active).map(e => e.id))), 'schedule-generated (employees)');
 
-  return { skipped: false, week: await store.getScheduleWeek(weekStart) };
+  return { skipped: false, week: await store.getScheduleWeek(weekStart), wasPublished };
+}
+
+// The manager approved the week: from now on employees see it. Each active employee gets a
+// personal note (in the app + on the phone) with how many shifts they got that week.
+async function publishWeek(store, weekStart) {
+  const week = await store.getScheduleWeek(weekStart);
+  if (!week || !week.assignments.length) throw new Error('empty_week');
+  const [employees, settings] = await Promise.all([store.listEmployees(), store.getSettings()]);
+  const wasPublishedBefore = await store.publishWeek(weekStart);
+  dropTeamChanges(store, weekStart); // everyone gets the full picture now — edit notes are moot
+  const verb = wasPublishedBefore ? ' עודכן' : ' פורסם';
+  await store.deleteNotifications({ audience: 'employee', type: 'schedule-published', relatedId: weekStart });
+  const countByEmp = {};
+  week.assignments.forEach(a => { countByEmp[a.employeeId] = (countByEmp[a.employeeId] || 0) + 1; });
+  const team = employees.filter(x => x.active);
+  for (const e of team) {
+    const n = countByEmp[e.id] || 0;
+    await store.addNotification({
+      audience: 'employee', employeeId: e.id, type: 'schedule-published', relatedId: weekStart,
+      text: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + verb + ' — ' + (n ? ('שובצת ל-' + n + ' משמרות. לפרטים: לשונית "הלוז שלי".') : 'לא שובצת למשמרות בשבוע הזה.'),
+      severity: 'info', channels: ['inapp', 'push'],
+    });
+  }
+  // One push per person, so each one says how many shifts *they* got.
+  for (const e of team) {
+    const n = countByEmp[e.id] || 0;
+    await safePush(push.broadcastTo(store, {
+      title: pushTitle(settings),
+      body: 'הלוז לשבוע ' + weekRangeLabel(weekStart) + verb + ' — ' + (n ? ('יש לך ' + n + ' משמרות') : 'לא שובצת השבוע'),
+      tag: 'schedule-' + weekStart,
+      url: '/?tab=myschedule&week=' + weekStart,
+    }, push.toEmployees([e.id]), { quiet: true }), 'schedule-published');
+  }
+  console.log('[publish] week', weekStart, 'published to', team.length, 'employees');
+  return { published: true, wasPublishedBefore, employees: team.length };
 }
 
 async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
@@ -274,6 +303,7 @@ async function openSwapRequest(store, { assignmentId, requesterId, kind }) {
   if (!assignment) throw new Error('assignment_not_found');
   if (assignment.employeeId !== requesterId) throw new Error('not_owner');
   if (await store.getOpenSwapForAssignment(assignmentId)) throw new Error('already_open');
+  if (!(await store.isWeekPublished(assignment.weekStart))) throw new Error('not_published');
   const requester = await store.getEmployee(requesterId);
   const [employees, templates, settings] = await Promise.all([store.listEmployees(), store.listShiftTemplates(), store.getSettings()]);
   const template = templates.find(t => t.id === assignment.shiftTemplateId);
@@ -361,7 +391,7 @@ async function claimSwapRequest(store, { swapId, claimerId }) {
   }
   // reassign the shift to the claimer
   await store.removeAssignment(assignment.id);
-  await store.addAssignment(assignment.weekStart, assignment.date, assignment.shiftTemplateId, claimerId);
+  await store.addAssignment(assignment.weekStart, assignment.date, assignment.shiftTemplateId, claimerId, { manual: true });
 
   // The offer is taken — nobody else should keep seeing "you can take it".
   await retractSwapOffers(store, [swapId]);
@@ -396,9 +426,11 @@ async function cancelSwapRequest(store, { swapId, requesterId }) {
 }
 
 // ---------- manual schedule edits by the manager ----------
-// Both of these tell the affected employee right away (in-app + phone), so a shift added or
-// taken away by hand never goes unnoticed. Shifts already in the past are edited silently —
-// that's the manager fixing history for the hours report, not news for the employee.
+// On a PUBLISHED week, both of these tell the affected employee right away (in-app + phone) and
+// queue a note to their team, so a shift added or taken away by hand never goes unnoticed. On a
+// draft week nobody but the manager sees the schedule yet, so edits are silent — everyone hears
+// about the final result when the manager approves it. Shifts already in the past are edited
+// silently too — that's the manager fixing history for the hours report, not news.
 
 async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeId, override }) {
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || S.weekKeyOf(date) !== weekStart) throw new Error('invalid_date');
@@ -427,7 +459,7 @@ async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeI
   const choice = availRows.length ? availRows[0].choice : 'all'; // no submission yet => treated as available
   const constraintConflict = !S.isAvailableForShift(choice, bucket);
 
-  const id = await store.addAssignment(weekStart, date, shiftTemplateId, employeeId);
+  const id = await store.addAssignment(weekStart, date, shiftTemplateId, employeeId, { manual: true });
   const desc = shiftDesc(template, date);
   if (constraintConflict) {
     await store.addNotification({
@@ -436,7 +468,7 @@ async function manualAssign(store, { weekStart, date, shiftTemplateId, employeeI
       severity: 'warning', channels: ['inapp'],
     });
   }
-  const notified = date >= S.todayStr();
+  const notified = date >= S.todayStr() && await store.isWeekPublished(weekStart);
   if (notified) {
     await notifyEmployees(store, settings, [employeeId], {
       type: 'shift-added', relatedId: id,
@@ -457,7 +489,7 @@ async function manualRemove(store, assignmentId) {
   await store.removeAssignment(assignmentId);
   const droppedSwaps = await store.deleteOpenSwapsForAssignment(assignmentId);
   await retractSwapOffers(store, droppedSwaps);
-  const notified = assignment.date >= S.todayStr();
+  const notified = assignment.date >= S.todayStr() && await store.isWeekPublished(assignment.weekStart);
   if (notified) {
     await notifyEmployees(store, settings, [assignment.employeeId], {
       type: 'shift-removed', relatedId: assignmentId,
@@ -469,4 +501,4 @@ async function manualRemove(store, assignmentId) {
   return { notified };
 }
 
-module.exports = { generateWeek, openSwapRequest, claimSwapRequest, cancelSwapRequest, manualAssign, manualRemove, flushTeamChanges, setTeamChangeDelay };
+module.exports = { generateWeek, publishWeek, openSwapRequest, claimSwapRequest, cancelSwapRequest, manualAssign, manualRemove, flushTeamChanges, setTeamChangeDelay };

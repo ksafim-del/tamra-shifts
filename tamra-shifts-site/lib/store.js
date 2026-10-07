@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS assignments (
   date TEXT NOT NULL,
   shift_template_id TEXT NOT NULL,
   employee_id TEXT NOT NULL,
-  no_show INTEGER NOT NULL DEFAULT 0
+  no_show INTEGER NOT NULL DEFAULT 0,
+  manual INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_assignments_week ON assignments(week_start);
 CREATE INDEX IF NOT EXISTS idx_assignments_date ON assignments(date);
@@ -193,8 +194,10 @@ async function migrateTimestampColumns(db) {
   if (db.dialect !== 'postgres') {
     // SQLite (local dev databases on disk): only the newest column needs patching in — SQLite has
     // no "ADD COLUMN IF NOT EXISTS", so check first.
-    const cols = await db.all('PRAGMA table_info(employees)', []);
-    if (!cols.some(c => c.name === 'night_only')) await db.exec('ALTER TABLE employees ADD COLUMN night_only INTEGER NOT NULL DEFAULT 0');
+    const empCols = await db.all('PRAGMA table_info(employees)', []);
+    if (!empCols.some(c => c.name === 'night_only')) await db.exec('ALTER TABLE employees ADD COLUMN night_only INTEGER NOT NULL DEFAULT 0');
+    const asgCols = await db.all('PRAGMA table_info(assignments)', []);
+    if (!asgCols.some(c => c.name === 'manual')) await db.exec('ALTER TABLE assignments ADD COLUMN manual INTEGER NOT NULL DEFAULT 0');
     return;
   }
   const alters = [
@@ -212,6 +215,7 @@ async function migrateTimestampColumns(db) {
     'ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS allow_extra INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_senior INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE employees ADD COLUMN IF NOT EXISTS night_only INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE assignments ADD COLUMN IF NOT EXISTS manual INTEGER NOT NULL DEFAULT 0',
     // --- multi-tenant migration: every pre-existing row belongs to the original company ---
     "ALTER TABLE settings ADD COLUMN IF NOT EXISTS company_id TEXT NOT NULL DEFAULT 'tamra'",
     "ALTER TABLE employees ADD COLUMN IF NOT EXISTS company_id TEXT NOT NULL DEFAULT 'tamra'",
@@ -398,10 +402,31 @@ async function dedupeScheduleStatusNotifications(db) {
   }
 }
 
+// A week's schedule is a DRAFT (seen only by the manager) until the manager approves it — then
+// it's published and employees see it. This table records which weeks are published. Created
+// here rather than in SCHEMA so its very first creation can be detected: at that moment every
+// week that already exists was, under the old behaviour, already visible to employees, so those
+// are all marked published — nothing employees can see today disappears with this update. That
+// backfill happens exactly once (the table exists from then on).
+async function ensureWeekPublications(db) {
+  const exists = db.dialect === 'postgres'
+    ? (await db.get("SELECT to_regclass('week_publications') AS t", [])).t
+    : await db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'week_publications'", []);
+  if (exists) return;
+  await db.exec('CREATE TABLE IF NOT EXISTS week_publications (company_id TEXT NOT NULL, week_start TEXT NOT NULL, published_at BIGINT, ever_published INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (company_id, week_start))');
+  const weeks = await db.all('SELECT company_id, week_start FROM schedules UNION SELECT company_id, week_start FROM assignments', []);
+  const now = Date.now();
+  for (const w of weeks) {
+    await db.run('INSERT INTO week_publications (company_id, week_start, published_at, ever_published) VALUES (?, ?, ?, 1)', [w.company_id, w.week_start, now]);
+  }
+  if (weeks.length) console.log('[migrate] marked', weeks.length, 'existing weeks as published');
+}
+
 async function initSchema(db) {
   const statements = SCHEMA.split(';').map(s => s.trim()).filter(Boolean);
   for (const s of statements) await db.exec(s + ';');
   await migrateTimestampColumns(db);
+  await ensureWeekPublications(db);
   await ensureCompaniesSeeded(db);
   await deactivateOfficeTemplates(db);
   await applyScheduleTemplateSpecV2(db);
@@ -440,7 +465,9 @@ function rowToConstraint(r) {
   return { id: r.id, employeeId: r.employee_id, kind: r.kind, date: r.date || null, dayOfWeek: r.day_of_week == null ? null : r.day_of_week, allDay: !!r.all_day, start: r.start_time || null, end: r.end_time || null, createdAt: Number(r.created_at) };
 }
 function rowToAssignment(r) {
-  return { id: r.id, weekStart: r.week_start, date: r.date, shiftTemplateId: r.shift_template_id, employeeId: r.employee_id, noShow: !!r.no_show };
+  // manual: put there by hand (the manager, or a swap) rather than by the generator — kept when the
+  // manager regenerates the week with "keep my changes".
+  return { id: r.id, weekStart: r.week_start, date: r.date, shiftTemplateId: r.shift_template_id, employeeId: r.employee_id, noShow: !!r.no_show, manual: !!r.manual };
 }
 function rowToSwap(r) {
   return { id: r.id, assignmentId: r.assignment_id, requesterId: r.requester_id, roleId: r.role_id, kind: r.kind, status: r.status, claimedBy: r.claimed_by || null, createdAt: Number(r.created_at), resolvedAt: r.resolved_at == null ? null : Number(r.resolved_at), date: r.date || null, shiftTemplateId: r.shift_template_id || null };
@@ -585,14 +612,20 @@ function makeStore(db, companyId) {
       const seniorIssues = Object.keys(byFuelShift)
         .filter(key => !byFuelShift[key].some(empId => seniorById[empId]))
         .map(key => { const [date, shiftTemplateId] = key.split('|'); return { date, shiftTemplateId }; });
-      return { weekStart, understaffed, seniorIssues, generatedAt: row ? Number(row.generated_at) : null, assignments: mappedAssignments };
+      const pub = await db.get('SELECT published_at FROM week_publications WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
+      const publishedAt = pub && pub.published_at != null ? Number(pub.published_at) : null;
+      return { weekStart, understaffed, seniorIssues, generatedAt: row ? Number(row.generated_at) : null, assignments: mappedAssignments, published: publishedAt != null, publishedAt };
     },
     async listAllWeekKeys() {
       const rows = await db.all('SELECT week_start FROM schedules WHERE company_id = ? ORDER BY week_start ASC', [cid]);
       return rows.map(r => r.week_start);
     },
-    async saveGeneratedSchedule(weekStart, assignments, understaffed, generatedAt) {
-      await db.run('DELETE FROM assignments WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
+    // keep: which of the week's existing assignments stay ('none' = replace everything, 'manual'
+    // = keep the hand-made ones (manual=1), 'all' = keep every existing one) — whatever is kept
+    // was given to the generator as fixed (see generateSchedule), so it's built around them.
+    async saveGeneratedSchedule(weekStart, assignments, understaffed, generatedAt, { keep } = {}) {
+      if (keep === 'manual') await db.run('DELETE FROM assignments WHERE company_id = ? AND week_start = ? AND manual = 0', [cid, weekStart]);
+      else if (keep !== 'all') await db.run('DELETE FROM assignments WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
       await db.run('DELETE FROM schedules WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
       await db.run('INSERT INTO schedules (company_id, week_start, understaffed, generated_at) VALUES (?,?,?,?)',
         [cid, weekStart, JSON.stringify(understaffed), generatedAt]);
@@ -601,11 +634,37 @@ function makeStore(db, companyId) {
           [uid(), cid, weekStart, a.date, a.shiftTemplateId, a.employeeId]);
       }
     },
-    async addAssignment(weekStart, date, shiftTemplateId, employeeId) {
+    async addAssignment(weekStart, date, shiftTemplateId, employeeId, { manual } = {}) {
       const id = uid();
-      await db.run('INSERT INTO assignments (id, company_id, week_start, date, shift_template_id, employee_id, no_show) VALUES (?,?,?,?,?,?,0)',
-        [id, cid, weekStart, date, shiftTemplateId, employeeId]);
+      await db.run('INSERT INTO assignments (id, company_id, week_start, date, shift_template_id, employee_id, no_show, manual) VALUES (?,?,?,?,?,?,0,?)',
+        [id, cid, weekStart, date, shiftTemplateId, employeeId, manual ? 1 : 0]);
       return id;
+    },
+
+    // ---- draft / published weeks (see ensureWeekPublications) ----
+    async isWeekPublished(weekStart) {
+      const row = await db.get('SELECT published_at FROM week_publications WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
+      return !!(row && row.published_at != null);
+    },
+    // Returns whether this week had ever been published before (so the note can say "updated").
+    async publishWeek(weekStart) {
+      const row = await db.get('SELECT ever_published FROM week_publications WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
+      if (row) await db.run('UPDATE week_publications SET published_at = ?, ever_published = 1 WHERE company_id = ? AND week_start = ?', [Date.now(), cid, weekStart]);
+      else await db.run('INSERT INTO week_publications (company_id, week_start, published_at, ever_published) VALUES (?, ?, ?, 1)', [cid, weekStart, Date.now()]);
+      return !!(row && Number(row.ever_published));
+    },
+    async unpublishWeek(weekStart) {
+      await db.run('UPDATE week_publications SET published_at = NULL WHERE company_id = ? AND week_start = ?', [cid, weekStart]);
+    },
+    async listPublishedWeeks() {
+      const rows = await db.all('SELECT week_start FROM week_publications WHERE company_id = ? AND published_at IS NOT NULL', [cid]);
+      return rows.map(r => r.week_start);
+    },
+    // Weeks from `fromWeek` on that have shifts in them but haven't been approved yet.
+    async listDraftWeeks(fromWeek) {
+      const rows = await db.all('SELECT DISTINCT week_start FROM assignments WHERE company_id = ? AND week_start >= ? ORDER BY week_start ASC', [cid, fromWeek]);
+      const published = new Set(await this.listPublishedWeeks());
+      return rows.map(r => r.week_start).filter(w => !published.has(w));
     },
     async removeAssignment(id) { await db.run('DELETE FROM assignments WHERE id = ? AND company_id = ?', [id, cid]); },
     async getAssignment(id) {
