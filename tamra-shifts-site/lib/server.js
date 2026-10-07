@@ -17,6 +17,7 @@ const VALID_ROLES = ['fuel', 'store']; // office removed — no shifts are sched
 const VALID_GENDERS = ['male', 'female'];
 function isValidTimeStr(s) { return typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s); }
 // Shifts per week the manager sets for an employee: null/'' = flexible, otherwise a whole number 1-7.
+function isValidPin(v) { return v != null && /^\d{4,6}$/.test(String(v)); }
 function isValidShiftTarget(v) { return v == null || v === '' || (Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 7); }
 function normShiftTarget(v) { return v == null || v === '' ? null : Number(v); }
 function isValidDaysArray(d) { return Array.isArray(d) && d.length > 0 && d.every(x => Number.isInteger(x) && x >= 0 && x <= 6); }
@@ -267,8 +268,10 @@ function makeApp(store, opts) {
     if (!VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
     if (!isValidShiftTarget(body.maxShiftsPerWeek)) return sendJson(res, 400, { error: 'invalid_shifts_per_week' });
-    const emp = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: normShiftTarget(body.maxShiftsPerWeek), gender: body.gender || null, isSenior: !!body.isSenior, nightOnly: !!body.nightOnly });
-    return sendJson(res, 200, { employee: emp });
+    if (!isValidPin(body.pin)) return sendJson(res, 400, { error: 'invalid_pin' });
+    const created = await store.createEmployee({ name: body.name, roleId: body.roleId, pin: String(body.pin), maxShiftsPerWeek: normShiftTarget(body.maxShiftsPerWeek), gender: body.gender || null, isSenior: !!body.isSenior, nightOnly: !!body.nightOnly });
+    // the manager's screen shows each employee's PIN, so always send it back with the employee
+    return sendJson(res, 200, { employee: await store.getEmployee(created.id, { includePin: true }) });
   });
   route('PATCH', '/api/employees/:id', async (req, res, params, body) => {
     const session = await requireSession(req);
@@ -278,6 +281,8 @@ function makeApp(store, opts) {
     if (body.roleId && body.roleId !== 'office' && !VALID_ROLES.includes(body.roleId)) return sendJson(res, 400, { error: 'invalid_role' });
     if (body.gender && !VALID_GENDERS.includes(body.gender)) return sendJson(res, 400, { error: 'invalid_gender' });
     if (body.maxShiftsPerWeek !== undefined && !isValidShiftTarget(body.maxShiftsPerWeek)) return sendJson(res, 400, { error: 'invalid_shifts_per_week' });
+    // A PIN can be changed, but never blanked out (that would lock the employee out).
+    if (body.pin !== undefined && !isValidPin(body.pin)) return sendJson(res, 400, { error: 'invalid_pin' });
     const patch = Object.assign({}, body);
     if (patch.maxShiftsPerWeek !== undefined) patch.maxShiftsPerWeek = normShiftTarget(patch.maxShiftsPerWeek);
     if (patch.nightOnly !== undefined) patch.nightOnly = !!patch.nightOnly;
@@ -285,7 +290,7 @@ function makeApp(store, opts) {
     if (!emp) return sendJson(res, 404, { error: 'not_found' });
     // A deactivated employee's phones stop getting this company's notifications.
     if (body.active === false) await store.deletePushSubscriptionsForEmployee(emp.id);
-    return sendJson(res, 200, { employee: emp });
+    return sendJson(res, 200, { employee: await store.getEmployee(emp.id, { includePin: true }) });
   });
 
   // ---- shift templates (manager only) ----
