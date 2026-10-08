@@ -369,17 +369,22 @@ function makeApp(store, opts) {
       throw e;
     }
   });
-  route('GET', '/api/schedule/:weekStart/export.xlsx', async (req, res, params) => {
+  // ?role=fuel or ?role=store exports just that team's sheet (the button on the schedule tab
+  // exports whichever team is on screen); without it, both teams in one workbook.
+  route('GET', '/api/schedule/:weekStart/export.xlsx', async (req, res, params, body, query) => {
     const session = await requireSession(req);
     if (!session || session.type !== 'manager') return sendJson(res, 403, { error: 'forbidden' });
     const [week, templates, employees, settings] = await Promise.all([
       store.getScheduleWeek(params.weekStart), store.listShiftTemplates(), store.listEmployees(), store.getSettings(),
     ]);
     if (!week) return sendJson(res, 404, { error: 'not_generated' });
-    const sheets = scheduleExport.buildScheduleSheets(params.weekStart, templates, employees, week.assignments, settings.companyName);
+    const role = query && VALID_ROLES.includes(query.get('role')) ? query.get('role') : null;
+    const allSheets = scheduleExport.buildScheduleSheets(params.weekStart, templates, employees, week.assignments, settings.companyName);
+    const sheets = role ? allSheets.filter((sh, i) => ['fuel', 'store'][i] === role) : allSheets;
     const buffer = xlsxWriter.buildWorkbook(sheets);
-    const asciiName = 'schedule-' + params.weekStart + '.xlsx';
-    const utf8Name = encodeURIComponent('לוז שבועי ' + params.weekStart + '.xlsx');
+    const roleName = role === 'store' ? ' עובדי חנות' : (role === 'fuel' ? ' מתדלקים' : '');
+    const asciiName = 'schedule-' + (role ? role + '-' : '') + params.weekStart + '.xlsx';
+    const utf8Name = encodeURIComponent('לוז שבועי' + roleName + ' ' + params.weekStart + '.xlsx');
     res.writeHead(200, {
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': 'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + utf8Name,
