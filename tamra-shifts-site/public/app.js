@@ -1028,7 +1028,8 @@ function scheduleHtml() {
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
     + (week.generatedAt ? '<button class="btn secondary sm" data-action="regenerate-force">🔄 הפק מחדש</button>'
         : ('<button class="btn" data-action="generate-schedule">' + (week.assignments.length ? 'הפק לוז (משלים סביב השיבוצים הידניים)' : 'הפק לוז') + '</button>'))
-    + (week.generatedAt ? ('<a class="btn secondary sm" href="/api/schedule/' + wk + '/export.xlsx" download>⬇️ ייצוא לאקסל</a>') : '')
+    // an explicit file name (with .xlsx) — some phones otherwise save it as just "download"
+    + (week.assignments.length ? ('<a class="btn secondary sm" href="/api/schedule/' + wk + '/export.xlsx?role=' + roleFilter + '" download="' + esc('לוז ' + roleLabelPlural(roleFilter) + ' ' + wk + '.xlsx') + '">⬇️ ייצוא לאקסל — ' + esc(roleLabelPlural(roleFilter)) + '</a>') : '')
     + '</div></div>';
 
   // What the team submitted for this week — the basis for any manual decision.
